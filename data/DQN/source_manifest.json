@@ -1,0 +1,21 @@
+{
+  "crawled_at": "2026-08-17T14:30:47.763803+07:00",
+  "sources": [
+    {
+      "url": "https://tuyensinh.qnu.edu.vn/vi/tuyen-sinh-dai-hoc-chinh-quy-2027/tb-1906-thong-tin-tuyen-sinh-dai-hoc-nam-2026-cap-nhat-hinh-thuc-dao-tao-chinh-quy-1208",
+      "raw_html_path": "raw/qnu_admissions_2026.html",
+      "sha256": "32e5e9867af4144e114301f3c852686d76d6372e9b1de4e4f069eae273ca2d10",
+      "retrieved_at": "2026-08-17T14:30:45.761183+07:00"
+    },
+    {
+      "url": "https://tuyensinh.qnu.edu.vn/vi/diem-chuan-cac-nam/diem-chuan-trung-tuyen-dai-hoc-he-chinh-quy-nam-2025",
+      "raw_html_path": "raw/qnu_cutoff_2025.html",
+      "sha256": "a0ef0e40718d61d39cd505b6fbd698f8dcc788e608915374ba394f78a1124b19",
+      "retrieved_at": "2026-08-17T14:30:46.713929+07:00"
+    }
+  ],
+  "generated_files": [
+    "C:\\workspace\\thesis-project\\data-scrawler\\data\\DQN\\dqn_admission_offers_2026.csv",
+    "C:\\workspace\\thesis-project\\data-scrawler\\data\\DQN\\dqn_cutoff_scores_2025.csv"
+  ]
+}

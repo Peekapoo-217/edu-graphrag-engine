@@ -1,0 +1,12 @@
+# Environment variables (contains local credentials)
+.env
+
+# Python bytecode & cache
+__pycache__/
+*.pyc
+*.pyo
+
+# IDE & OS
+.vscode/
+.idea/
+.DS_Store

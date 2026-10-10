@@ -1,0 +1,371 @@
+<!DOCTYPE html>
+<html lang="vi">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Trợ lý AI Tư Vấn Tuyển Sinh</title>
+    <!-- Google Fonts & Marked.js -->
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
+
+    <style>
+        :root {
+            --primary: #2563eb;
+            --primary-hover: #1d4ed8;
+            --header-bg: #1e293b;
+            --bg-body: #f8fafc;
+            --chat-bg: #ffffff;
+            --bot-bubble: #f1f5f9;
+            --bot-text: #0f172a;
+            --user-bubble: #2563eb;
+            --user-text: #ffffff;
+            --border: #e2e8f0;
+        }
+
+        * {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+
+        body {
+            font-family: 'Inter', system-ui, -apple-system, sans-serif;
+            background-color: var(--bg-body);
+            color: #334155;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            min-height: 100vh;
+            padding: 20px;
+        }
+
+        .chat-container {
+            width: 100%;
+            max-width: 680px;
+            height: 720px;
+            background: var(--chat-bg);
+            border-radius: 16px;
+            box-shadow: 0 10px 30px -5px rgba(0, 0, 0, 0.08), 0 4px 12px -2px rgba(0, 0, 0, 0.04);
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+            border: 1px solid var(--border);
+        }
+
+        .chat-header {
+            background: var(--header-bg);
+            color: white;
+            padding: 16px 20px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+
+        .header-title h2 {
+            font-size: 1.05rem;
+            font-weight: 600;
+        }
+
+        .status-badge {
+            font-size: 0.75rem;
+            color: #94a3b8;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+            margin-top: 2px;
+        }
+
+        .status-dot {
+            width: 7px;
+            height: 7px;
+            background-color: #22c55e;
+            border-radius: 50%;
+        }
+
+        .clear-btn {
+            background: rgba(255, 255, 255, 0.1);
+            color: #cbd5e1;
+            border: 1px solid rgba(255, 255, 255, 0.15);
+            padding: 6px 12px;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 0.8rem;
+            font-weight: 500;
+            transition: all 0.2s;
+        }
+
+        .clear-btn:hover {
+            background: rgba(255, 255, 255, 0.2);
+            color: white;
+        }
+
+        .chat-messages {
+            flex: 1;
+            padding: 20px;
+            overflow-y: auto;
+            display: flex;
+            flex-direction: column;
+            gap: 14px;
+            background: #ffffff;
+        }
+
+        .message {
+            max-width: 82%;
+            padding: 12px 16px;
+            border-radius: 14px;
+            font-size: 0.93rem;
+            line-height: 1.55;
+            word-wrap: break-word;
+        }
+
+        .user-msg {
+            background: var(--user-bubble);
+            color: var(--user-text);
+            align-self: flex-end;
+            border-bottom-right-radius: 3px;
+        }
+
+        .bot-msg {
+            background: var(--bot-bubble);
+            color: var(--bot-text);
+            align-self: flex-start;
+            border-bottom-left-radius: 3px;
+            border: 1px solid #e2e8f0;
+        }
+
+        /* Formatting inside bot message */
+        .bot-msg h3, .bot-msg h4 {
+            color: #1e3a8a;
+            margin: 8px 0 4px 0;
+            font-size: 0.98rem;
+        }
+
+        .bot-msg p {
+            margin-bottom: 6px;
+        }
+
+        .bot-msg p:last-child {
+            margin-bottom: 0;
+        }
+
+        .bot-msg ul, .bot-msg ol {
+            margin: 4px 0 8px 18px;
+        }
+
+        .bot-msg strong {
+            color: #0f172a;
+        }
+
+        /* Animated Thinking Dots Indicator */
+        .thinking-indicator {
+            display: none;
+            align-self: flex-start;
+            background: var(--bot-bubble);
+            padding: 12px 18px;
+            border-radius: 14px;
+            border-bottom-left-radius: 3px;
+            border: 1px solid var(--border);
+        }
+
+        .thinking-dots {
+            display: flex;
+            align-items: center;
+            gap: 5px;
+            height: 12px;
+        }
+
+        .thinking-dots span {
+            width: 7px;
+            height: 7px;
+            background-color: #64748b;
+            border-radius: 50%;
+            animation: blink 1.4s infinite ease-in-out both;
+        }
+
+        .thinking-dots span:nth-child(1) { animation-delay: -0.32s; }
+        .thinking-dots span:nth-child(2) { animation-delay: -0.16s; }
+
+        @keyframes blink {
+            0%, 80%, 100% { transform: scale(0.6); opacity: 0.4; }
+            40% { transform: scale(1); opacity: 1; }
+        }
+
+        .chat-input-area {
+            display: flex;
+            padding: 14px 18px;
+            background: #ffffff;
+            border-top: 1px solid var(--border);
+            gap: 10px;
+        }
+
+        .chat-input-area input {
+            flex: 1;
+            padding: 11px 16px;
+            border: 1px solid var(--border);
+            border-radius: 10px;
+            outline: none;
+            font-size: 0.93rem;
+            color: #0f172a;
+            background: #f8fafc;
+            transition: all 0.2s;
+        }
+
+        .chat-input-area input:focus {
+            border-color: var(--primary);
+            background: #ffffff;
+            box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.1);
+        }
+
+        .chat-input-area button {
+            background: var(--primary);
+            color: white;
+            border: none;
+            padding: 11px 20px;
+            border-radius: 10px;
+            cursor: pointer;
+            font-weight: 600;
+            font-size: 0.93rem;
+            transition: background 0.2s;
+        }
+
+        .chat-input-area button:hover {
+            background: var(--primary-hover);
+        }
+    </style>
+</head>
+
+<body>
+
+    <div class="chat-container">
+        <!-- Header -->
+        <div class="chat-header">
+            <div class="header-title">
+                <h2>Trợ lý Tư vấn Tuyển sinh AI</h2>
+                <div class="status-badge">
+                    <span class="status-dot"></span> Neo4j Knowledge Graph Connected
+                </div>
+            </div>
+            <button class="clear-btn" onclick="clearHistory()">Xóa cuộc hội thoại</button>
+        </div>
+
+        <!-- Messages -->
+        <div class="chat-messages" id="chatBox">
+            <div class="message bot-msg">
+                <strong>Xin chào bạn!</strong> Mình là trợ lý tư vấn tuyển sinh đại học & định hướng THPT. 
+                Bạn cần tìm hiểu về ngành học, trường đại học hay trường THPT nào?
+            </div>
+
+            <!-- Thinking Indicator -->
+            <div class="thinking-indicator" id="loadingIndicator">
+                <div class="thinking-dots">
+                    <span></span>
+                    <span></span>
+                    <span></span>
+                </div>
+            </div>
+        </div>
+
+        <!-- Input -->
+        <div class="chat-input-area">
+            <input type="text" id="userInput" placeholder="Nhập câu hỏi tư vấn của bạn..." onkeypress="handleEnter(event)">
+            <button onclick="sendMessage()">Gửi</button>
+        </div>
+    </div>
+
+    <script>
+        const API_URL = "http://localhost:8000/api/chat";
+        let chatHistory = [];
+
+        async function sendMessage() {
+            const inputField = document.getElementById("userInput");
+            const messageText = inputField.value.trim();
+            if (!messageText) return;
+
+            appendMessage(messageText, "user-msg", false);
+            inputField.value = "";
+
+            showThinking(true);
+
+            try {
+                const response = await fetch(API_URL, {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({
+                        user_message: messageText,
+                        context: chatHistory,
+                        chat_history: chatHistory
+                    })
+                });
+
+                if (!response.ok) throw new Error(`Lỗi HTTP Server: ${response.status}`);
+
+                const data = await response.json();
+
+                showThinking(false);
+                appendMessage(data.message, "bot-msg", true);
+
+                chatHistory.push({ role: "user", content: messageText });
+                chatHistory.push({ role: "assistant", content: data.message });
+
+            } catch (error) {
+                showThinking(false);
+                appendMessage("Không thể kết nối đến server (`" + error.message + "`). Vui lòng kiểm tra lại server `python rag_api/main_api.py` đã khởi chạy chưa.", "bot-msg", true);
+            }
+        }
+
+        function appendMessage(text, className, isMarkdown) {
+            const chatBox = document.getElementById("chatBox");
+            const loading = document.getElementById("loadingIndicator");
+
+            const msgDiv = document.createElement("div");
+            msgDiv.className = `message ${className}`;
+
+            if (isMarkdown && typeof marked !== "undefined") {
+                msgDiv.innerHTML = marked.parse(text);
+            } else {
+                msgDiv.textContent = text;
+            }
+
+            chatBox.insertBefore(msgDiv, loading);
+            scrollToBottom();
+        }
+
+        function clearHistory() {
+            chatHistory = [];
+            const chatBox = document.getElementById("chatBox");
+            chatBox.innerHTML = `
+                <div class="message bot-msg">
+                    <strong>Đã làm sạch hội thoại!</strong> Bạn có thể bắt đầu chủ đề tư vấn mới.
+                </div>
+                <div class="thinking-indicator" id="loadingIndicator">
+                    <div class="thinking-dots">
+                        <span></span>
+                        <span></span>
+                        <span></span>
+                    </div>
+                </div>
+            `;
+        }
+
+        function showThinking(show) {
+            const loading = document.getElementById("loadingIndicator");
+            loading.style.display = show ? "block" : "none";
+            scrollToBottom();
+        }
+
+        function handleEnter(event) {
+            if (event.key === "Enter") sendMessage();
+        }
+
+        function scrollToBottom() {
+            const chatBox = document.getElementById("chatBox");
+            chatBox.scrollTop = chatBox.scrollHeight;
+        }
+    </script>
+
+</body>
+
+</html>
