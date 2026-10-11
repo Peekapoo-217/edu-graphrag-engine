@@ -224,11 +224,11 @@ python sync_postgres_to_neo4j.py [--dry-run] [--verify] [--batch-size 500]
 ```
 ================ NEO4J GRAPH VERIFICATION REPORT ================
 Node Labels & Totals:
-  Subject                :   20
+  Subject                :   22
   HighSchool             :    2
   SubjectGroup           :    8
   University             :    1
-  TrainingProgram        :   53
+  TrainingProgram        :   54
   AdmissionCombination   :   50
   AptitudeTest           :    2
   CutoffScore            :   52
@@ -237,7 +237,7 @@ Relationship Types & Totals:
   OFFERS_GROUP           :    8
   INCLUDES_SUBJECT       :   32
   IS_VARIANT_OF          :    4
-  OFFERS_PROGRAM         :   53
+  OFFERS_PROGRAM         :   54
   ACCEPTS_COMBINATION    :  316
   REQUIRES_SUBJECT       :  143
   REQUIRES_APTITUDE      :    7
@@ -254,7 +254,33 @@ Orphan Node Diagnostics:
 
 ### 7.6 Reference Counts
 
-Script chứa `REFERENCE_COUNTS` dictionary để so sánh với kết quả thực tế sau sync. Nếu khác biệt sẽ in WARNING.
+Sau sync, script so sánh số node và quan hệ trong Neo4j với projection vừa đọc từ PostgreSQL. Nếu khác biệt sẽ in WARNING; không dùng số đếm cố định.
+
+### 7.7 Danh mục tổ hợp mở rộng
+
+Chạy trong `data-scrawler` sau khi đã cấu hình `DATABASE_URL` trong `.env`:
+
+```powershell
+python import_combination_labels.py --dry-run --promote-normalized
+python import_combination_labels.py --promote-normalized
+python sync_postgres_to_neo4j.py --dry-run
+python sync_postgres_to_neo4j.py
+```
+
+`--promote-normalized` chỉ tạo tổ hợp chuẩn có đúng ba môn thường, đã chuẩn hóa và có trong bảng `subjects`. Hai mã nguồn cùng bộ môn cùng liên kết một tổ hợp. Mã nguồn xung đột, môn năng khiếu, môn chưa ánh xạ và bộ môn thiếu dữ liệu tiếp tục chỉ nằm trong `admission_combination_labels`. Import lặp lại không tạo thêm tổ hợp hoặc component. Chỉ đồng bộ Neo4j sau khi import PostgreSQL thành công.
+
+### 7.8 Chuẩn hóa danh mục tổ hợp có môn lựa chọn
+
+```powershell
+python import_combination_labels.py --dry-run --normalize-catalogue
+python import_combination_labels.py --normalize-catalogue
+python sync_postgres_to_neo4j.py --dry-run
+python sync_postgres_to_neo4j.py
+```
+
+`--normalize-catalogue` đọc snapshot hai cột gốc và tách lựa chọn có dấu `/` thành từng dòng `subject_details` cụ thể. Ví dụ `K01: Toán, Văn, Lý/Hóa/Sinh/Tin` cho bốn nhãn `K01` khác nhau; `K01: Toán, Tiếng Anh, Tin học` vẫn là nhãn thứ năm. Dòng gốc có dấu `/` được giữ để truy vết, không gán một canonical ID tùy ý. Nhãn cụ thể được nối với bộ thành phần chuẩn theo nội dung, kể cả khi cùng public code có nhiều mô tả. Tổ hợp mới có thể chứa môn phổ thông và bài năng khiếu; bài năng khiếu chỉ nằm trong `admission_combination_components` kiểu `APTITUDE`, không được ghi vào `subjects`.
+
+Năm ngoại ngữ được gọi tên rõ trong snapshot (`FRENCH`, `RUSSIAN`, `GERMAN`, `KOREAN`, `JAPANESE`) được thêm vào `subjects` trước khi tạo component. Các tên chung như “Ngoại ngữ”, “Năng khiếu” và “Khoa học” tiếp tục chờ đối chiếu, vì không chỉ ra môn hoặc bài thi cụ thể. Không dùng đồng thời `--promote-normalized` và `--normalize-catalogue`.
 
 ---
 
@@ -306,3 +332,9 @@ python sync_postgres_to_neo4j.py
 # Step 6: Verify
 python sync_postgres_to_neo4j.py --verify
 ```
+
+## 10. Mã nội bộ cho nhãn tổ hợp nguồn chưa rõ
+
+Khi chạy `python import_combination_labels.py --normalize-catalogue`, tên “Ngoại ngữ” không chỉ rõ ngôn ngữ được lưu với subject code `FOREIGN_LANGUAGE_UNSPECIFIED`. Các cụm nguồn “Năng khiếu”, “NK1”, “Khoa học”, “Khoa học tự nhiên”, “Khoa học xã hội” có component code `APTITUDE_CATALOGUE_<hash>` dựa trên mã nguồn và tên gốc. Chúng là tên đánh giá chưa xác định; trong schema V1, component loại `APTITUDE` được graph chiếu thành `AptitudeTest`, nên không diễn giải các node này như bài thi năng khiếu đã được xác minh.
+
+Nếu cột “Tổ hợp” của nguồn không phải mã hợp lệ, importer giữ dòng gốc và tạo thêm nhãn `SRC<7 ký tự hex>` ổn định để liên kết canonical theo môn chi tiết. Tiền tố `SRC` là mã nội bộ, không phải mã chính thức. Dòng gốc có dấu `/` vẫn được giữ với canonical null; các dòng đã tách có liên kết riêng. Sau khi thay đổi danh mục trong PostgreSQL, chạy dry run rồi đồng bộ Neo4j theo lệnh ở mục 7.8. Không tự tạo `offer_combinations` từ danh mục hai cột; chỉ dữ liệu tuyển sinh theo trường/ngành/năm mới đủ căn cứ.

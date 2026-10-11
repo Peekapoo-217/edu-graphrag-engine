@@ -28,30 +28,6 @@ from graph_sync.neo4j_writer import (
     verify_neo4j_constraints,
 )
 
-REFERENCE_COUNTS = {
-    "nodes": {
-        "Subject": 20,
-        "HighSchool": 2,
-        "SubjectGroup": 8,
-        "University": 1,
-        "TrainingProgram": 53,
-        "AdmissionCombination": 50,
-        "AptitudeTest": 2,
-        "CutoffScore": 52,
-    },
-    "relationships": {
-        "OFFERS_GROUP": 8,
-        "INCLUDES_SUBJECT": 32,
-        "IS_VARIANT_OF": 4,
-        "OFFERS_PROGRAM": 53,
-        "ACCEPTS_COMBINATION": 316,
-        "REQUIRES_SUBJECT": 143,
-        "REQUIRES_APTITUDE": 7,
-        "HAS_CUTOFF": 52,
-    },
-}
-
-
 def load_env_file(env_path: str = ".env"):
     """Load environment variables from .env file into os.environ if present."""
     if os.path.exists(env_path):
@@ -169,8 +145,7 @@ def main():
         stats = verify_graph_statistics(driver, neo4j_database)
         print_verification_report(stats)
 
-        # Check reference comparison
-        check_reference_counts(stats)
+        check_reference_counts(stats, graph_data)
     except Exception as e:
         print(f"[ERROR] Synchronization failed: {e}", file=sys.stderr)
         sys.exit(1)
@@ -217,25 +192,27 @@ def print_verification_report(stats: Dict[str, Any]):
     print("=================================================================\n")
 
 
-def check_reference_counts(stats: Dict[str, Any]):
+def check_reference_counts(stats: Dict[str, Any], graph_data: Dict[str, Any]):
     actual_nodes = stats.get("nodes", {})
     actual_rels = stats.get("relationships", {})
 
     mismatch = False
-    for label, ref_cnt in REFERENCE_COUNTS["nodes"].items():
+    for label, rows in graph_data["nodes"].items():
+        ref_cnt = len(rows)
         act_cnt = actual_nodes.get(label, 0)
         if act_cnt != ref_cnt:
             print(f"[WARNING] Reference node count mismatch for '{label}': expected {ref_cnt}, found {act_cnt}")
             mismatch = True
 
-    for rel_type, ref_cnt in REFERENCE_COUNTS["relationships"].items():
+    for rel_type, rows in graph_data["relationships"].items():
+        ref_cnt = len(rows)
         act_cnt = actual_rels.get(rel_type, 0)
         if act_cnt != ref_cnt:
-            print(f"[WARNING] Reference relationship count mismatch for '{rel_type}': expected {ref_cnt}, found {act_cnt}")
+            print(f"[WARNING] Projected relationship count mismatch for '{rel_type}': expected {ref_cnt}, found {act_cnt}")
             mismatch = True
 
     if not mismatch:
-        print("[INFO] All actual node and relationship counts match the expected reference numbers perfectly!")
+        print("[INFO] Neo4j counts match the PostgreSQL projection.")
 
 
 if __name__ == "__main__":

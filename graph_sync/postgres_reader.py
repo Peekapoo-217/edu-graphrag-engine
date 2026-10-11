@@ -17,18 +17,20 @@ REQUIRED_POSTGRES_SCHEMA: Dict[str, List[str]] = {
     "high_schools": ["code", "name", "location"],
     "subject_groups": ["school_code", "academic_year", "group_code", "group_name", "subject_code"],
     "universities": ["university_code", "university_name", "website"],
+    "majors": ["program_code", "program_name"],
     "admission_offers": [
-        "university_code", "admission_year", "program_code", "program_name",
-        "method_codes", "quota", "canonical_combination_id", "source_url"
+        "id", "university_code", "admission_year", "program_code",
+        "method_codes", "quota", "source_url"
     ],
+    "offer_combinations": ["offer_id", "canonical_combination_id"],
     "admission_combinations": ["combination_id", "combination_display", "component_count"],
     "admission_combination_components": [
         "combination_id", "component_code", "component_name",
         "component_type", "subject_code", "weight"
     ],
     "cutoff_scores": [
-        "university_code", "admission_year", "program_code", "program_name",
-        "method_code", "score_type", "cutoff_score_thpt", "cutoff_score_sat", "source_url"
+        "university_code", "admission_year", "program_code",
+        "method_code", "cutoff_score_thpt", "cutoff_score_sat", "source_url"
     ],
 }
 
@@ -139,10 +141,12 @@ def fetch_all_graph_data_from_postgres(conn: psycopg.Connection) -> Dict[str, An
 
         # 5. Training Programs, OFFERS_PROGRAM, ACCEPTS_COMBINATION
         cur.execute("""
-            SELECT university_code, admission_year, program_code, program_name,
-                   method_codes, quota, canonical_combination_id, source_url
-            FROM admission_offers
-            ORDER BY university_code, program_code, admission_year;
+            SELECT o.university_code, o.admission_year, o.program_code, m.program_name,
+                   o.method_codes, o.quota, oc.canonical_combination_id, o.source_url
+            FROM admission_offers o
+            JOIN majors m ON m.program_code = o.program_code
+            LEFT JOIN offer_combinations oc ON oc.offer_id = o.id
+            ORDER BY o.university_code, o.program_code, o.admission_year, oc.canonical_combination_id;
         """)
         offer_rows = cur.fetchall()
 
@@ -160,14 +164,15 @@ def fetch_all_graph_data_from_postgres(conn: psycopg.Connection) -> Dict[str, An
                     "name": prog_name,
                 }
             offers_program_set.add((univ_code, tp_uid))
-            accepts_combination_relations.append({
-                "training_program_uid": tp_uid,
-                "combination_id": comb_id,
-                "admission_year": int(adm_year),
-                "method_codes": method_codes,
-                "quota": int(quota) if quota is not None else None,
-                "source_url": source_url,
-            })
+            if comb_id is not None:
+                accepts_combination_relations.append({
+                    "training_program_uid": tp_uid,
+                    "combination_id": comb_id,
+                    "admission_year": int(adm_year),
+                    "method_codes": method_codes,
+                    "quota": int(quota) if quota is not None else None,
+                    "source_url": source_url,
+                })
 
         # 6. Admission Combinations & Components (Aptitude, REQUIRES_SUBJECT, REQUIRES_APTITUDE)
         cur.execute("SELECT combination_id, combination_display, component_count FROM admission_combinations ORDER BY combination_id;")
@@ -211,17 +216,19 @@ def fetch_all_graph_data_from_postgres(conn: psycopg.Connection) -> Dict[str, An
 
         # 7. Cutoff Scores & HAS_CUTOFF
         cur.execute("""
-            SELECT university_code, admission_year, program_code, program_name, method_code, score_type,
-                   cutoff_score_thpt, cutoff_score_sat, source_url
-            FROM cutoff_scores
-            ORDER BY university_code, admission_year, program_code;
+            SELECT c.university_code, c.admission_year, c.program_code, m.program_name,
+                   c.method_code, c.cutoff_score_thpt, c.cutoff_score_sat, c.source_url
+            FROM cutoff_scores c
+            JOIN majors m ON m.program_code = c.program_code
+            ORDER BY c.university_code, c.admission_year, c.program_code, c.method_code;
         """)
         cutoff_rows = cur.fetchall()
 
         cutoff_scores: List[Dict[str, Any]] = []
         has_cutoff_relations: List[Dict[str, Any]] = []
 
-        for univ_code, adm_year, prog_code, prog_name, method_code, score_type, score_thpt, score_sat, source_url in cutoff_rows:
+        for univ_code, adm_year, prog_code, prog_name, method_code, score_thpt, score_sat, source_url in cutoff_rows:
+            score_type = "OFFICIAL_CUTOFF"
             uid = make_cutoff_score_uid(univ_code, int(adm_year), prog_code, method_code, score_type)
             tp_uid = make_training_program_uid(univ_code, prog_code)
             

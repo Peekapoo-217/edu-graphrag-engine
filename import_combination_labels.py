@@ -4,6 +4,7 @@
 import argparse
 from collections import Counter, defaultdict
 import csv
+from dataclasses import dataclass
 from datetime import datetime
 import hashlib
 import json
@@ -16,15 +17,20 @@ from dotenv import load_dotenv
 
 from crawlers.common.subject_normalizer import normalize_subject_label
 from crawl_combination_labels import CSV_COLUMNS, clean_text
+from combination_label_normalizer import (
+    CatalogueComponent, NEW_SUBJECTS, expand_details,
+    normalize_catalogue_component, split_components, synthetic_source_code,
+)
 
 
 VALID_CODE = re.compile(r"[A-Z0-9]{2,10}\Z")
 DEFAULT_ENV_PATH = Path(__file__).resolve().parent / ".env"
 REQUIRED_COLUMNS = {
-    "admission_combinations": {"combination_id", "component_count"},
+    "admission_combinations": {"combination_id", "combination_display", "component_count"},
     "admission_combination_components": {
-        "combination_id", "component_type", "subject_code"
+        "combination_id", "component_code", "component_name", "component_type", "subject_code", "weight"
     },
+    "subjects": {"code", "name", "subject_type", "is_mandatory"},
     "admission_combination_labels": {
         "code", "subject_details", "canonical_combination_id", "source_url",
         "source_period", "retrieved_at"
@@ -127,6 +133,163 @@ def prepare_links(
     return prepared, reasons
 
 
+def plan_promotions(
+    rows: list[dict[str, str]],
+    component_rows: list[tuple[str, int, str, str | None]],
+    existing_ids: set[str],
+    subject_names: dict[str, str],
+) -> tuple[list[tuple[str, str, str | None]], Counter[str], dict[str, tuple[str, ...]]]:
+    """Plan safe three-subject canonical rows without changing the database."""
+    index = build_combination_index(component_rows)
+    prepared, reasons = prepare_links(rows, index)
+    planned: dict[str, tuple[str, ...]] = {}
+    promoted = []
+    for code, details, canonical_id in prepared:
+        if canonical_id is None and VALID_CODE.fullmatch(code):
+            parts = [clean_text(part) for part in details.split(",")]
+            if len(parts) == 3:
+                normalized = [normalize_subject_label(part)[0] for part in parts]
+                if all(item is not None and item.component_type == "SUBJECT" for item in normalized):
+                    subject_codes = tuple(sorted(item.subject_code for item in normalized))
+                    if len(set(subject_codes)) == 3 and not index.get(frozenset(subject_codes)):
+                        candidate_id = "_".join(subject_codes)
+                        if (candidate_id not in existing_ids
+                                and all(subject_code in subject_names for subject_code in subject_codes)
+                                and len(candidate_id) <= 255
+                                and len(" - ".join(subject_names[s] for s in subject_codes)) <= 255):
+                            # A public code with conflicting descriptions is never promoted.
+                            if len({r["subject_details"] for r in rows if r["combination_code"] == code}) == 1:
+                                planned[candidate_id] = subject_codes
+                                canonical_id = candidate_id
+                                reasons["no_unique_canonical_combination"] -= 1
+        promoted.append((code, details, canonical_id))
+    return promoted, +reasons, planned
+
+
+@dataclass
+class CataloguePlan:
+    rows: list[tuple[str, str, str | None]]
+    reasons: Counter[str]
+    combinations: dict[str, tuple[CatalogueComponent, ...]]
+    subjects: dict[str, str]
+    expanded_rows: int
+
+
+def build_catalogue_index(
+    component_rows: list[tuple[str, int, str, str, str | None]],
+) -> dict[frozenset[tuple[str, str]], list[str]]:
+    by_id: dict[str, list[tuple[str, str]]] = defaultdict(list)
+    counts: dict[str, int] = {}
+    for combination_id, count, kind, component_code, subject_code in component_rows:
+        counts[combination_id] = count
+        by_id[combination_id].append((kind, subject_code if kind == "SUBJECT" else component_code))
+    index: dict[frozenset[tuple[str, str]], list[str]] = defaultdict(list)
+    for combination_id, parts in by_id.items():
+        if len(parts) == counts[combination_id] == len(set(parts)):
+            index[frozenset(parts)].append(combination_id)
+    return dict(index)
+
+
+def plan_catalogue_normalization(
+    rows: list[dict[str, str]],
+    component_rows: list[tuple[str, int, str, str, str | None]],
+    existing_ids: set[str],
+    subject_names: dict[str, str],
+) -> CataloguePlan:
+    """Resolve each concrete source variant against existing or new components."""
+    index = build_catalogue_index(component_rows)
+    prepared: list[tuple[str, str, str | None]] = []
+    reasons: Counter[str] = Counter()
+    new_combinations: dict[str, tuple[CatalogueComponent, ...]] = {}
+    new_subjects: dict[str, str] = {}
+    expanded_rows = 0
+    source_codes = {source["combination_code"] for source in rows}
+    for source in rows:
+        source_code, source_details = source["combination_code"], source["subject_details"]
+        try:
+            variants = expand_details(source_details)
+        except ValueError:
+            variants = [source_details]
+        expanded_rows += len(variants) - 1
+        codes = [source_code]
+        if not VALID_CODE.fullmatch(source_code):
+            generated_code = synthetic_source_code(source_code, source_details)
+            if generated_code not in source_codes:
+                codes.append(generated_code)
+        for code, details in ((code, detail) for code in codes for detail in variants):
+            canonical_id = None
+            reason = None
+            if not VALID_CODE.fullmatch(code):
+                reason = "invalid_code"
+            else:
+                try:
+                    parts = split_components(details)
+                except ValueError:
+                    parts = []
+                    reason = "invalid_details"
+                components = [normalize_catalogue_component(part, code) for part in parts]
+                if reason:
+                    pass
+                elif any(component is None for component in components):
+                    reason = "unmapped_or_ambiguous_component"
+                else:
+                    components = [
+                        CatalogueComponent(
+                            component.code,
+                            (subject_names.get(component.code)
+                             or NEW_SUBJECTS.get(component.code)
+                             or component.name) if component.component_type == "SUBJECT"
+                            else component.name,
+                            component.component_type, component.subject_code,
+                        ) for component in components
+                    ]
+                if reason:
+                    pass
+                elif len({(component.component_type, component.code) for component in components}) != len(components):
+                    reason = "duplicate_component"
+                else:
+                    component_key = frozenset((part.component_type, part.code) for part in components)
+                    matches = index.get(component_key, [])
+                    if len(matches) == 1:
+                        canonical_id = matches[0]
+                    elif len(matches) > 1:
+                        reason = "multiple_existing_combinations"
+                    else:
+                        candidate_id = "_".join(sorted(part.code for part in components))
+                        missing = {
+                            part.code: NEW_SUBJECTS[part.code]
+                            for part in components
+                            if part.component_type == "SUBJECT"
+                            and part.code not in subject_names
+                            and part.code in NEW_SUBJECTS
+                        }
+                        if any(part.component_type == "SUBJECT"
+                               and part.code not in subject_names
+                               and part.code not in missing for part in components):
+                            reason = "missing_subject"
+                        elif (candidate_id in existing_ids
+                              or candidate_id in new_combinations and
+                              frozenset((p.component_type, p.code) for p in new_combinations[candidate_id]) != component_key):
+                            reason = "canonical_id_collision"
+                        elif (len(candidate_id) > 255
+                              or len(" - ".join(part.name for part in components)) > 255
+                              or any(len(part.code) > 100 or len(part.name) > 150
+                                     or part.subject_code and len(part.subject_code) > 30
+                                     for part in components)):
+                            reason = "canonical_value_too_long"
+                        else:
+                            new_subjects.update(missing)
+                            new_combinations[candidate_id] = tuple(
+                                sorted(components, key=lambda part: part.code)
+                            )
+                            index[component_key] = [candidate_id]
+                            canonical_id = candidate_id
+            if reason:
+                reasons[reason] += 1
+            prepared.append((code, details, canonical_id))
+    return CataloguePlan(prepared, reasons, new_combinations, new_subjects, expanded_rows)
+
+
 def verify_db_schema(cursor: Any) -> None:
     cursor.execute("""
         SELECT table_name, column_name
@@ -145,10 +308,16 @@ def verify_db_schema(cursor: Any) -> None:
         raise RuntimeError(f"Database schema is missing columns: {missing}. Apply Flyway V3 first.")
 
 
-def import_snapshot(rows: list[dict[str, str]], manifest: dict[str, Any], database_url: str) -> Counter[str]:
+def import_snapshot(
+    rows: list[dict[str, str]], manifest: dict[str, Any], database_url: str,
+    promote_normalized: bool = False, dry_run: bool = False,
+    normalize_catalogue: bool = False,
+) -> tuple[Counter[str], int, int, int, int]:
     import psycopg
 
     with psycopg.connect(database_url) as connection:
+        if dry_run:
+            connection.read_only = True
         with connection.transaction():
             with connection.cursor() as cursor:
                 verify_db_schema(cursor)
@@ -162,13 +331,101 @@ def import_snapshot(rows: list[dict[str, str]], manifest: dict[str, Any], databa
                     raise ValueError("Snapshot is older than the latest imported snapshot")
 
                 cursor.execute("""
-                    SELECT c.combination_id, c.component_count, comp.component_type, comp.subject_code
+                    SELECT c.combination_id, c.component_count, comp.component_type,
+                           comp.component_code, comp.subject_code
                     FROM admission_combinations c
                     JOIN admission_combination_components comp
                       ON comp.combination_id = c.combination_id
                     ORDER BY c.combination_id
                 """)
-                prepared, reasons = prepare_links(rows, build_combination_index(cursor.fetchall()))
+                component_rows = cursor.fetchall()
+                if normalize_catalogue:
+                    cursor.execute("SELECT combination_id FROM admission_combinations")
+                    existing_ids = {record[0] for record in cursor.fetchall()}
+                    cursor.execute("SELECT code, name FROM subjects")
+                    subject_names = dict(cursor.fetchall())
+                    catalogue_plan = plan_catalogue_normalization(
+                        rows, component_rows, existing_ids, subject_names
+                    )
+                    prepared = catalogue_plan.rows.copy()
+                    reasons = catalogue_plan.reasons
+                    for source in rows:
+                        try:
+                            is_expanded = len(expand_details(source["subject_details"])) > 1
+                        except ValueError:
+                            is_expanded = False
+                        if is_expanded:
+                            prepared.append((source["combination_code"], source["subject_details"], None))
+                    planned = catalogue_plan.combinations
+                    if not dry_run:
+                        for subject_code, subject_name in sorted(catalogue_plan.subjects.items()):
+                            cursor.execute("""
+                                INSERT INTO subjects (code, name, subject_type, is_mandatory)
+                                VALUES (%s, %s, 'ACADEMIC', false)
+                                ON CONFLICT (code) DO NOTHING
+                                RETURNING code
+                            """, (subject_code, subject_name))
+                            if cursor.fetchone() is None:
+                                raise RuntimeError(f"Subject code collision: {subject_code}")
+                        for combination_id, components in sorted(planned.items()):
+                            cursor.execute("""
+                                INSERT INTO admission_combinations
+                                    (combination_id, combination_display, component_count)
+                                VALUES (%s, %s, %s)
+                                ON CONFLICT (combination_id) DO NOTHING
+                                RETURNING combination_id
+                            """, (combination_id, " - ".join(part.name for part in components), len(components)))
+                            if cursor.fetchone() is None:
+                                raise RuntimeError(f"Canonical combination ID collision: {combination_id}")
+                            for part in components:
+                                cursor.execute("""
+                                    INSERT INTO admission_combination_components
+                                        (combination_id, component_code, component_name,
+                                         component_type, subject_code, weight)
+                                    VALUES (%s, %s, %s, %s, %s, 1)
+                                """, (combination_id, part.code, part.name,
+                                      part.component_type, part.subject_code))
+                    new_subject_count = len(catalogue_plan.subjects)
+                elif promote_normalized:
+                    cursor.execute("SELECT combination_id FROM admission_combinations")
+                    existing_ids = {record[0] for record in cursor.fetchall()}
+                    cursor.execute("SELECT code, name FROM subjects")
+                    subject_names = dict(cursor.fetchall())
+                    prepared, reasons, planned = plan_promotions(
+                        rows, [(cid, count, kind, subject)
+                               for cid, count, kind, _, subject in component_rows],
+                        existing_ids, subject_names
+                    )
+                    if not dry_run:
+                        for combination_id, subject_codes in sorted(planned.items()):
+                            cursor.execute("""
+                                INSERT INTO admission_combinations
+                                    (combination_id, combination_display, component_count)
+                                VALUES (%s, %s, 3)
+                                ON CONFLICT (combination_id) DO NOTHING
+                                RETURNING combination_id
+                            """, (combination_id, " - ".join(subject_names[s] for s in subject_codes)))
+                            if cursor.fetchone() is None:
+                                raise RuntimeError(f"Canonical combination ID collision: {combination_id}")
+                            for subject_code in subject_codes:
+                                cursor.execute("""
+                                    INSERT INTO admission_combination_components
+                                        (combination_id, component_code, component_name,
+                                         component_type, subject_code, weight)
+                                    VALUES (%s, %s, %s, 'SUBJECT', %s, 1)
+                                """, (combination_id, subject_code, subject_names[subject_code], subject_code))
+                    new_subject_count = 0
+                else:
+                    prepared, reasons = prepare_links(rows, build_combination_index(
+                        [(cid, count, kind, subject)
+                         for cid, count, kind, _, subject in component_rows]
+                    ))
+                    planned = {}
+                    new_subject_count = 0
+                if dry_run:
+                    return (reasons, len(planned), len(prepared),
+                            sum(canonical_id is not None for _, _, canonical_id in prepared),
+                            new_subject_count)
                 for code, details, canonical_id in prepared:
                     cursor.execute("""
                         INSERT INTO admission_combination_labels
@@ -176,25 +433,33 @@ def import_snapshot(rows: list[dict[str, str]], manifest: dict[str, Any], databa
                              source_url, source_period, retrieved_at)
                         VALUES (%s, %s, %s, %s, %s, %s)
                         ON CONFLICT (source_url, source_period, code, subject_details)
-                        DO UPDATE SET canonical_combination_id = EXCLUDED.canonical_combination_id,
+                        DO UPDATE SET canonical_combination_id = COALESCE(
+                                          admission_combination_labels.canonical_combination_id,
+                                          EXCLUDED.canonical_combination_id),
                                       retrieved_at = EXCLUDED.retrieved_at
                     """, (
                         code, details, canonical_id, manifest["source_url"],
                         manifest["source_period"], retrieved_at,
                     ))
-    return reasons
+    return (reasons, len(planned), len(prepared),
+            sum(canonical_id is not None for _, _, canonical_id in prepared),
+            new_subject_count)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--csv", type=Path, default=Path("data/combination_labels/combination_labels.csv"))
     parser.add_argument("--manifest", type=Path, default=Path("data/combination_labels/source_manifest.json"))
-    parser.add_argument("--dry-run", action="store_true", help="Validate files without a database write")
+    parser.add_argument("--dry-run", action="store_true", help="Validate without a database write; promotion also checks database")
+    parser.add_argument("--promote-normalized", action="store_true", help="Create canonical combinations for safe, new three-subject sets")
+    parser.add_argument("--normalize-catalogue", action="store_true", help="Expand explicit alternatives and normalize subjects and named tests")
     args = parser.parse_args()
+    if args.promote_normalized and args.normalize_catalogue:
+        parser.error("Choose either --promote-normalized or --normalize-catalogue")
 
     rows, manifest = load_snapshot(args.csv, args.manifest)
     print(f"Validated {len(rows)} labels from {manifest['source_url']}")
-    if args.dry_run:
+    if args.dry_run and not (args.promote_normalized or args.normalize_catalogue):
         conflicts = sum(
             len({row["subject_details"] for row in rows if row["combination_code"] == code}) > 1
             for code in {row["combination_code"] for row in rows}
@@ -203,8 +468,14 @@ def main() -> None:
         return
 
     database_url = load_database_url()
-    reasons = import_snapshot(rows, manifest, database_url)
-    print(f"Imported {len(rows)} labels; linked {len(rows) - sum(reasons.values())}")
+    reasons, created, prepared_count, linked_count, subject_count = import_snapshot(
+        rows, manifest, database_url, args.promote_normalized,
+        args.dry_run, args.normalize_catalogue,
+    )
+    verb = "Would upsert" if args.dry_run else "Upserted"
+    print(f"{verb} {prepared_count} label rows from {len(rows)} source rows; "
+          f"linked variants: {linked_count}; "
+          f"new canonical combinations: {created}; new subjects: {subject_count}")
     print("Unlinked by reason: " + json.dumps(reasons, ensure_ascii=False, sort_keys=True))
 
 

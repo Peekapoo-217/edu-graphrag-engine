@@ -37,7 +37,7 @@ CANONICAL_SUBJECT_MAP = {
 |------|--------|-----|
 | `make_subject_group_uid(school_code, academic_year, group_code)` | `{school}\|{year}\|{group}` | `TCV\|2026\|G01` |
 | `make_training_program_uid(university_code, program_code)` | `{univ}\|{program}` | `DQN\|7480201` |
-| `make_cutoff_score_uid(univ_code, year, program_code, method_code, score_type)` | `{univ}\|{year}\|{program}\|{method}\|{type}` | `DQN\|2025\|7480201\|100\|THPT` |
+| `make_cutoff_score_uid(univ_code, year, program_code, method_code, score_type)` | `{univ}\|{year}\|{program}\|{method}\|{type}` | `DQN\|2025\|7480201\|100\|OFFICIAL_CUTOFF` |
 
 ### 3.3 Node Dataclasses
 
@@ -56,7 +56,7 @@ CANONICAL_SUBJECT_MAP = {
 
 ### 4.1 `REQUIRED_POSTGRES_SCHEMA`
 
-Dictionary định nghĩa 8 bảng và các cột bắt buộc:
+Dictionary định nghĩa 10 bảng và các cột bắt buộc:
 
 | Bảng | Cột bắt buộc |
 |------|--------------|
@@ -64,10 +64,14 @@ Dictionary định nghĩa 8 bảng và các cột bắt buộc:
 | `high_schools` | code, name, location |
 | `subject_groups` | school_code, academic_year, group_code, group_name, subject_code |
 | `universities` | university_code, university_name, website |
-| `admission_offers` | university_code, admission_year, program_code, program_name, method_codes, quota, canonical_combination_id, source_url |
+| `majors` | program_code, program_name |
+| `admission_offers` | id, university_code, admission_year, program_code, method_codes, quota, source_url |
+| `offer_combinations` | offer_id, canonical_combination_id |
 | `admission_combinations` | combination_id, combination_display, component_count |
 | `admission_combination_components` | combination_id, component_code, component_name, component_type, subject_code, weight |
-| `cutoff_scores` | university_code, admission_year, program_code, program_name, method_code, score_type, cutoff_score_thpt, cutoff_score_sat, source_url |
+| `cutoff_scores` | university_code, admission_year, program_code, method_code, cutoff_score_thpt, cutoff_score_sat, source_url |
+
+Reader lấy tên ngành từ `majors`, lấy tổ hợp của từng offer qua `offer_combinations` và đặt `CutoffScore.score_type = OFFICIAL_CUTOFF` trong graph vì PostgreSQL không có cột `score_type`. UID điểm chuẩn hiện có được giữ nguyên. Nhãn tổ hợp chưa liên kết không được chiếu sang Neo4j; tổ hợp chuẩn mới có node và các cạnh `REQUIRES_SUBJECT`, nhưng chỉ có `ACCEPTS_COMBINATION` khi có offer thực tế.
 
 ### 4.2 Các hàm
 
