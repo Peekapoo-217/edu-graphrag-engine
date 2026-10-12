@@ -1,0 +1,14 @@
+FROM python:3.11-slim
+ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1
+WORKDIR /app
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    tesseract-ocr tesseract-ocr-vie ghostscript qpdf pngquant unpaper \
+    && rm -rf /var/lib/apt/lists/*
+COPY requirements-rag.txt .
+RUN pip install --no-cache-dir -r requirements-rag.txt \
+    && pip install --no-cache-dir ocrmypdf
+COPY rag_api ./rag_api
+COPY pdf_extraction_worker.py .
+RUN useradd --create-home --shell /bin/bash appuser && chown -R appuser:appuser /app
+USER appuser
+CMD ["python", "pdf_extraction_worker.py"]

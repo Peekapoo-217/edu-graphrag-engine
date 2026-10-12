@@ -35,11 +35,26 @@ def load_env_file(env_path: Optional[str] = None) -> None:
 load_env_file()
 
 
+def _database_url() -> Optional[str]:
+    configured = os.getenv("DATABASE_URL")
+    if configured:
+        return configured
+    jdbc_url = os.getenv("SPRING_DATASOURCE_URL", "")
+    if not jdbc_url.startswith("jdbc:postgresql://"):
+        return None
+    from urllib.parse import quote, urlsplit, urlunsplit
+    parsed = urlsplit(jdbc_url.removeprefix("jdbc:"))
+    username = quote(os.getenv("SPRING_DATASOURCE_USERNAME", ""), safe="")
+    password = quote(os.getenv("SPRING_DATASOURCE_PASSWORD", ""), safe="")
+    auth = f"{username}:{password}@" if username else ""
+    return urlunsplit(("postgresql", auth + (parsed.hostname or "") + (f":{parsed.port}" if parsed.port else ""), parsed.path, parsed.query, ""))
+
+
 @dataclass
 class Settings:
     """Centralized System Settings loaded from environment variables."""
     # Database Settings
-    DATABASE_URL: Optional[str] = os.getenv("DATABASE_URL")
+    DATABASE_URL: Optional[str] = _database_url()
 
     # Neo4j Settings
     NEO4J_URI: str = os.getenv("NEO4J_URI", "")
@@ -59,6 +74,8 @@ class Settings:
     API_PORT: int = int(os.getenv("API_PORT", "8000"))
     SUBJECT_PATHWAY_API_URL: str = os.getenv("SUBJECT_PATHWAY_API_URL", "http://localhost:8080").rstrip("/")
     SUBJECT_PATHWAY_API_TIMEOUT: float = float(os.getenv("SUBJECT_PATHWAY_API_TIMEOUT", "8.0"))
+    SUBJECT_PATHWAY_INTERNAL_API_URL: str = os.getenv("SUBJECT_PATHWAY_INTERNAL_API_URL", "http://localhost:8080").rstrip("/")
+    INTERNAL_SERVICE_TOKEN: Optional[str] = os.getenv("INTERNAL_SERVICE_TOKEN")
 
     # Ollama Embedding Settings
     OLLAMA_HOST: str = os.getenv("OLLAMA_HOST", "")

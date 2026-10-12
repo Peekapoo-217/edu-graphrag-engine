@@ -153,7 +153,12 @@ async def chat_endpoint(request: ChatRequest) -> ChatResponse:
 
     # Step 1 & 2: Parse Intent & Query Routing
     try:
-        intent_result = parser.parse_intent(
+        active_parser = parser
+        intent_profile = _managed_llm_profile("INTENT")
+        if intent_profile:
+            active_parser = IntentParser(api_base=intent_profile["endpoint"],
+                                          api_key=intent_profile["apiKey"], model=intent_profile["model"])
+        intent_result = active_parser.parse_intent(
             user_message=request.user_message,
             context=conversation_context
         )
@@ -164,7 +169,7 @@ async def chat_endpoint(request: ChatRequest) -> ChatResponse:
         if intent_result.get("intent") == "subject_group_recommendation":
             return _recommend_subject_group(intent_result)
 
-        if intent_status == "incomplete" or not parser.is_ready_for_db(intent_result):
+        if intent_status == "incomplete" or not active_parser.is_ready_for_db(intent_result):
             msg = reply_to_user or "Bạn đang quan tâm đến ngành học/lĩnh vực nào hoặc trường đại học nào để mình hỗ trợ tra cứu chi tiết nhé?"
             return ChatResponse(
                 status="incomplete",
@@ -172,6 +177,8 @@ async def chat_endpoint(request: ChatRequest) -> ChatResponse:
                 data={"extracted_filters": extracted_filters}
             )
 
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error during Intent Parsing step: {e}")
         raise HTTPException(
@@ -194,20 +201,18 @@ async def chat_endpoint(request: ChatRequest) -> ChatResponse:
     # Step 4: Generate LLM Answer
     try:
         active_generator = generator
-        if request.override_config:
-            ov = request.override_config
-            if ov.get("api_key") or ov.get("model") or ov.get("base_url"):
-                active_generator = RAGGenerator(
-                    api_base=ov.get("base_url") or None,
-                    api_key=ov.get("api_key") or None,
-                    model=ov.get("model") or None
-                )
+        chat_profile = _managed_llm_profile("CHAT")
+        if chat_profile:
+            active_generator = RAGGenerator(api_base=chat_profile["endpoint"],
+                                            api_key=chat_profile["apiKey"], model=chat_profile["model"])
 
         answer_text = active_generator.generate_answer(
             user_query=request.user_message,
             graph_context=formatted_context,
             context=conversation_context
         )
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Error during Answer Generation step: {e}")
         raise HTTPException(
@@ -237,6 +242,25 @@ def _api_data(response: requests.Response) -> Any:
     response.raise_for_status()
     body = response.json()
     return body.get("data") if isinstance(body, dict) else None
+
+
+def _managed_llm_profile(purpose: str) -> Optional[Dict[str, str]]:
+    """Load a SUPER_ADMIN managed profile for this server-side purpose, never from the public request."""
+    if not settings.INTERNAL_SERVICE_TOKEN:
+        return None
+    try:
+        response = requests.get(
+            f"{settings.SUBJECT_PATHWAY_INTERNAL_API_URL}/api/v1/internal/llm/{purpose}",
+            headers={"X-Internal-Service-Token": settings.INTERNAL_SERVICE_TOKEN},
+            timeout=settings.SUBJECT_PATHWAY_API_TIMEOUT)
+        response.raise_for_status()
+        profile = response.json()
+        if not all(isinstance(profile.get(key), str) and profile[key] for key in ("endpoint", "model", "apiKey")):
+            raise ValueError("Invalid managed LLM profile")
+        return profile
+    except (requests.RequestException, ValueError, TypeError) as exc:
+        logger.error("Managed LLM profile unavailable for purpose %s (%s)", purpose, type(exc).__name__)
+        raise HTTPException(status_code=503, detail="Cấu hình dịch vụ AI hiện chưa sẵn sàng.") from exc
 
 
 def _recommend_subject_group(intent: Dict[str, Any]) -> ChatResponse:

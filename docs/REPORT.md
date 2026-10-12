@@ -1,5 +1,19 @@
 # REPORT - data-scrawler
 
+## Admin THPT và trích xuất PDF — 2026-10-12
+
+Checklist dùng chung cho phần data-scrawler:
+
+- [x] Worker nhận job trích xuất từ PostgreSQL và lấy PDF riêng tư từ R2.
+- [x] Đọc text PDF, OCR trang scan tiếng Việt/Anh, giới hạn kích thước/trang và dọn file tạm.
+- [x] Trích xuất draft có trường nguồn trang; kiểm tra dữ liệu LLM như đầu vào không tin cậy.
+- [x] Không tự công bố dữ liệu; backend quản lý phê duyệt và ghi nhóm môn chuẩn hóa.
+- [x] Kiểm thử worker và cập nhật tài liệu contract.
+
+Ghi nhận ban đầu: `.env` chưa có R2 vars, requirements chưa có thư viện PDF và chưa có worker/job. Cấu hình key được giữ kín; chưa thử kết nối R2.
+
+Cập nhật triển khai: worker đã được thêm và truy vấn các bảng workflow qua schema `admin` (`admin.extraction_jobs`, `admin.school_document_versions`, `admin.school_documents`, `admin.subject_group_drafts`); danh mục môn vẫn nằm trong `public.subjects`. Cần backend áp dụng Flyway V6 trước khi chạy worker. Contract và hướng dẫn cấu hình ở `docs/pdf_worker.md`. `python -m unittest discover -s tests` đã chạy: 42 test đạt; chưa kiểm tra kết nối R2 hoặc PostgreSQL thực.
+
 ## Report: cào danh mục tổ hợp môn
 
 Ngày triển khai: 2026-10-10. Nguồn: https://diemthi.tuyensinh247.com/to-hop-mon.html
