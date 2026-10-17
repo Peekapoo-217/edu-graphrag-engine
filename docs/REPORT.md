@@ -1,5 +1,21 @@
 # REPORT - data-scrawler
 
+## Đồng bộ worker với xóa tài liệu — 2026-10-14
+
+- [x] T1. Worker không claim job của tài liệu DELETE_REQUESTED/DELETED; khóa tài liệu trước khi claim và trước khi ghi kết quả để đồng bộ thứ tự khóa với backend.
+- [x] T2. Sau OCR/LLM, kiểm tra lại trạng thái tài liệu và job; bỏ kết quả nếu tài liệu đã xóa hoặc job đã bị CANCELLED. Khi chỉ có yêu cầu xóa, job đang chạy có thể ghi draft nhưng không đổi trạng thái DELETE_REQUESTED.
+- [x] T3. Giữ nguyên hành vi retry/failure khi tài liệu còn hoạt động; lỗi muộn không làm sống lại tài liệu đã xóa.
+- [x] T4. Thêm unit test cho trạng thái claim, stop khi đã xóa, và giữ trạng thái xóa yêu cầu. `python -m unittest discover -s tests`: 57 test đạt.
+- [ ] Chưa restart worker triển khai; backend và worker cần được cập nhật cùng nhau để dùng trạng thái job CANCELLED từ Flyway V7.
+
+## OCR–ETL ảnh tài liệu THPT — 2026-10-13
+
+- [x] Worker đọc `content_type`, giữ OCR PDF và bổ sung nhánh ảnh PNG/JPEG/WebP. Ảnh được giải mã, giới hạn 20 megapixel, OCR cục bộ bằng Tesseract rồi gửi văn bản tới model `EXTRACTION`; JSON và mã môn được kiểm tra trước khi tạo bản nháp nguồn `[1]`.
+- [x] Phân loại lỗi model/timeout an toàn, không để job phiên bản cũ ghi đè trạng thái phiên bản mới. Request đặt `stream=false` để gateway trả JSON thay vì SSE mặc định.
+- [x] `python -m unittest discover -s tests`: 54 test đạt. Đã build và recreate `pdf-worker` với Tesseract OCR ảnh và request văn bản.
+- [x] Chẩn đoán route vision 9Router trả HTTP 200 nhưng không đọc ảnh; chuyển sang OCR cục bộ và sửa Tesseract dùng `--psm 3` sau khi `--psm 6` bỏ mất các hàng bảng.
+- [x] Retry tài liệu mẫu qua API: job `SUCCEEDED`, document `DRAFT_READY`, 3 draft nhóm môn hợp lệ được lưu ở trang 1.
+
 ## Admin THPT và trích xuất PDF — 2026-10-12
 
 Checklist dùng chung cho phần data-scrawler:
@@ -157,3 +173,77 @@ Các mã ở trên có thể lặp vì một dòng có nhiều thành phần chu
 - [x] 8. Phân tích ảnh hưởng tới toàn bộ bảng admission bằng skill schema và crawler. **Report:** Chỉ bốn bảng danh mục/nhãn/component/subject cần thêm hoặc cập nhật bản ghi. admission_offers, offer_combinations, majors, cutoff_scores không đủ dữ liệu để thay đổi, giữ 53/316/54/52 bản ghi. Không cần migration Flyway cho thao tác hiện tại; xem docs/REPORT.md.
 - [x] 9. Chạy test, dry run, ghi PostgreSQL, đồng bộ và kiểm tra Neo4j. **Report:** 39 test đạt; PostgreSQL hiện có 300 nhãn, 297 gắn canonical, 3 dòng gốc null, 257 tổ hợp, 772 component và 28 subject. Dry run lặp lại: 0 tổ hợp/subject mới. Neo4j khớp projection, 316 ACCEPTS_COMBINATION, không orphan.
 - [x] 10. Ghi báo cáo ngữ nghĩa mã nội bộ, phạm vi thay đổi bảng và giới hạn hiện tại. **Report:** docs/REPORT.md và phần bổ sung trong tài liệu vận hành. Chỉ data-scrawler có thay đổi mã/tài liệu trong đợt này.
+# OCR worker 9Router connectivity
+
+- [x] Configure Docker `pdf-worker` to reach the host 9Router at `host.docker.internal:20128`; keep `localhost:20128` valid for direct Windows execution from `.env`.
+- [x] Add unit coverage for environment profile fallback and for an environment API key combined with an active admin endpoint/model override.
+- [x] Document the host-versus-container endpoint distinction in `docs/pdf_worker.md`.
+- [x] Recreate the worker and confirm it reaches the configured 9Router `/v1/models` endpoint (HTTP 200).
+- [x] Recreate the worker with the text OCR pipeline and retry the existing failed extraction job; verify the resulting review draft against the source image.
+
+## OCR ảnh thành văn bản trước khi gọi 9Router — 2026-10-13
+
+- [x] Chuẩn hóa ảnh theo EXIF và chạy Tesseract với `vie+eng`, tự phân tích bố cục (`--psm 3`) và giữ khoảng cách cột; gửi OCR text cho Claude qua request chat completions dạng JSON.
+- [x] Dùng prompt tiếng Việt chỉ lấy cột “Tổ hợp môn lựa chọn”/“Nhóm môn lựa chọn”, bỏ qua “Chuyên đề học tập” và các cột khác; yêu cầu đúng bốn môn có trong danh mục và không tự đoán.
+- [x] Phân biệt `OCR_EMPTY`, `OCR_ENGINE_ERROR`, `OCR_TIMEOUT`; không gọi LLM khi OCR rỗng; giữ validation JSON, mã môn và số trang trước khi tạo draft.
+- [x] Rebuild/recreate worker rồi retry tài liệu mẫu; job `SUCCEEDED`, document `DRAFT_READY`, lưu ba nhóm `01`/`02`/`03` khớp môn lựa chọn trong nguồn.
+
+## Công bố nhóm môn và đồng bộ Neo4j tự động — 2026-10-14
+
+- [x] Cập nhật PDF/image extraction contract sang 1–4 mã môn khác nhau; worker chỉ ghi draft vào `admin` và dùng bảng mới `admin.extraction_log`.
+- [x] Thêm `graph_projection_worker.py`: claim outbox bằng `SKIP LOCKED`, đọc các nhóm đã công bố từ PostgreSQL, MERGE vào Neo4j, retry exponential backoff và không lưu thông tin lỗi nội bộ.
+- [x] Thêm Dockerfile/service Compose riêng; ép worker dùng datasource đã cấu hình cho container thay vì `DATABASE_URL` local từ `.env`.
+- [x] Bổ sung unit test cho nhóm 1–4 môn, dữ liệu rỗng/sai số lượng, Neo4j projection thành công và retry khi lỗi.
+- [x] Cập nhật `docs/pdf_worker.md` và `docs/graph_sync.md`; `python -m unittest discover -s tests`: 63 test đạt.
+
+Worker projection cần backend áp dụng Flyway V8 và database/Neo4j đang hoạt động. Trong phiên này chỉ chạy test offline và xác thực cú pháp Compose; chưa khởi động worker hoặc ghi dữ liệu thật lên Neo4j.
+
+## Ràng buộc tổ hợp chatbot với nhóm môn THPT — 2026-10-14
+
+- [x] Tách truy vấn nhóm trường khỏi truy vấn admission; không còn nối `Subject` của tổ hợp với nhóm THPT qua một cạnh môn bất kỳ.
+- [x] Chỉ giữ tổ hợp khi mọi môn yêu cầu đều có trong nhóm mới nhất của trường hoặc là môn bắt buộc; dùng mã canonical khi có, không xác nhận tổ hợp cần thi năng khiếu chỉ bằng nhóm môn THPT.
+- [x] Giữ `ACCEPTS_COMBINATION` làm điều kiện offer thực; không coi nhóm THPT là dữ liệu admission hay kết luận đủ điều kiện trúng tuyển.
+- [x] Bổ sung test trường hợp chỉ trùng một môn bị loại, môn bắt buộc được tính vào coverage, và chỉ xét năm học mới nhất.
+- [x] Kiểm tra: `python -m unittest discover -s tests` (65 test đạt); `EXPLAIN` thành công cho truy vấn admission, nhóm trường và môn bắt buộc trên Neo4j.
+- [x] Rebuild/recreate service `rag-api`; `/health` báo Neo4j `connected`. Không ghi hay đồng bộ thêm dữ liệu graph trong bước này.
+
+## Đồng bộ CRUD trường THPT và cấu hình model qua environment — 2026-10-16
+
+- [x] Mở rộng `graph_projection_worker.py` để ưu tiên outbox `admin.high_school_graph_sync_jobs`, đồng bộ trường/nhóm môn qua mọi năm học và xóa node trường/nhóm khi đổi mã hoặc xóa mềm.
+- [x] Lọc trường/nhóm đã xóa trong projection nhóm incremental và trong full PostgreSQL reader; xử lý job nhóm cũ như no-op khi trường/nhóm không còn hoạt động.
+- [x] Giữ truy vấn Neo4j tham số hóa, retry/backoff và mã lỗi an toàn. Cập nhật docs về schema V10 và xóa graph bất đồng bộ.
+- [x] Gỡ trạng thái cấu hình LLM qua endpoint nội bộ; RAG API và extraction worker dùng `LLM_API_KEY`, `LLM_API_BASE`, `LLM_MODEL` từ `.env`.
+- [x] Kiểm thử: `python -m unittest discover -s tests` (69 test đạt); test bổ sung trường có nhiều năm, xóa node có tham số và đổi mã trường.
+- [ ] Chưa chạy worker với PostgreSQL/Neo4j thật; cần áp dụng backend migration V10 và rebuild/recreate `graph-projection-worker` sau khi cập nhật container.
+
+## S3-compatible storage for document extraction - 2026-10-16
+
+- [x] Point the PDF/image worker at shared `OBJECT_STORAGE_*` settings for MinIO or R2, use path-style S3 addressing, and remove fallback to legacy `R2_*` variables. OCR, LLM prompting, validation and draft writes are unchanged.
+- [x] Report missing objects as terminal `STORAGE_OBJECT_MISSING` jobs and add an idempotent bucket initializer for the Docker MinIO profile.
+- [x] Verification: focused extraction/storage tests 24/24; full `python -m unittest discover -s tests` passed 74 tests.
+- [ ] No worker container was started. OCR against a real MinIO object and end-to-end draft creation remain to be smoke-tested after services are started.
+
+## Xóa nhóm môn đã ngừng công bố khỏi Neo4j và dựng lại khi restore — 2026-10-17
+
+- [x] Full reader và incremental worker tách nhóm đang công bố khỏi danh sách tombstone lấy từ `admin.subject_group_publication_state`; nhóm hết nguồn công bố không còn được gửi vào tập node/cạnh cần tạo.
+- [x] Neo4j writer xóa node bằng `DETACH DELETE` theo UID, đồng thời kiểm tra trường/năm/mã nhóm và revision. Ghi nhóm môn trong transaction; các node `HighSchool`/`Subject` dùng chung vẫn còn.
+- [x] Worker tài liệu, worker trường và full-sync dùng chung PostgreSQL advisory lock, đọc trạng thái nguồn mới nhất trước khi ghi để tránh job cũ dựng lại node vừa xóa.
+- [x] Full-sync dry-run báo số nhóm sẽ xóa; kiểm tra graph cảnh báo nếu node ngừng công bố còn sót.
+- [x] Kiểm tra: `python -m unittest discover -s tests` — 84 test đạt; `compileall` và `git diff --check` đạt.
+- [ ] Chưa chạy full-sync hoặc worker trên PostgreSQL/Neo4j thật. Sau khi build lại worker, cần `--dry-run`, chạy full-sync để dọn node cũ, rồi kiểm tra query Neo4j trước/sau restore.
+# Khôi phục trường và đồng bộ graph theo trạng thái PostgreSQL — 2026-10-16
+
+- [x] Worker khóa bản ghi trường trong khi áp dụng Neo4j projection và quyết định UPSERT/cleanup theo trạng thái hiện tại, xử lý an toàn job DELETE cũ sau khi restore.
+- [x] Không báo SYNCED cho document projection thiếu nhóm dự kiến ở một trường còn hoạt động; ghi log terminal cho school jobs và giữ retry/backoff.
+- [x] Kiểm thử: `python -m unittest discover -s tests` (78 test đạt).
+- [ ] Chưa chạy worker với PostgreSQL/Neo4j thật; migration backend V12 cần được áp dụng trước khi cập nhật service.
+
+## Đồng bộ trạng thái công bố tài liệu lên Neo4j — 2026-10-17
+
+> Trạng thái tại thời điểm ghi report này đã được thay thế: bản cập nhật cùng ngày bên dưới xóa node `SubjectGroup` và các cạnh của nhóm đã ngừng công bố; restore dựng lại node từ PostgreSQL.
+
+- [x] Projection reader/worker truyền trạng thái công bố và revision trên quan hệ trường–nhóm môn.
+- [x] Neo4j writer chỉ áp dụng revision mới nhất: ngừng công bố thì xóa cạnh `OFFERS_GROUP`; khôi phục thì tạo lại cạnh. Node trường/nhóm và cạnh `INCLUDES_SUBJECT` được giữ lại.
+- [x] Bỏ nhóm đã ngừng công bố khỏi chẩn đoán orphan; full sync lấy trạng thái hiện tại từ PostgreSQL để hội tụ lại graph.
+- [x] Kiểm thử: `python -m unittest discover -s tests` (80 test đạt).
+- [ ] Chưa xác minh truy vấn trên Neo4j thật; cần chạy worker sau khi các service và migration lifecycle đã sẵn sàng.

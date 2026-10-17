@@ -4,6 +4,7 @@ Does NOT connect to any real database.
 """
 
 import unittest
+from unittest.mock import MagicMock
 from typing import Dict, Any
 
 from graph_sync.models import (
@@ -16,7 +17,10 @@ from graph_sync.models import (
 from graph_sync.neo4j_writer import (
     NODE_CYPHER_STATEMENTS,
     RELATIONSHIP_CYPHER_STATEMENTS,
+    UNPUBLISHED_SUBJECT_GROUP_CYPHER,
     chunk_list,
+    sync_nodes_and_relationships,
+    verify_graph_statistics,
 )
 from graph_sync.validators import validate_graph_data
 
@@ -116,19 +120,128 @@ class TestGraphMapping(unittest.TestCase):
         self.assertEqual(len(chunks[1]), 500)
         self.assertEqual(len(chunks[2]), 50)
 
-    def test_cypher_queries_use_merge_no_raw_create_or_detach_delete(self):
-        """Audit all Cypher statements to ensure MERGE is used and no CREATE or DETACH DELETE exist."""
+    def test_cypher_queries_limit_deletes_to_publication_aware_school_relation(self):
+        """Only the publication-aware OFFERS_GROUP query deletes a relationship."""
         all_statements = list(NODE_CYPHER_STATEMENTS.values()) + list(RELATIONSHIP_CYPHER_STATEMENTS.values())
 
         for cypher in all_statements:
             cypher_upper = cypher.upper()
-            # Ensure MERGE is present
             self.assertIn("MERGE", cypher_upper)
-            # Ensure no DETACH DELETE
-            self.assertNotIn("DETACH DELETE", cypher_upper)
-            # Ensure no raw CREATE statements (MERGE is expected)
+            if cypher is not RELATIONSHIP_CYPHER_STATEMENTS["OFFERS_GROUP"]:
+                self.assertNotIn("DELETE ", cypher_upper)
             self.assertNotIn("CREATE ", cypher_upper)
             self.assertNotIn("CREATE(", cypher_upper)
+
+    def test_unpublished_projection_deletes_only_the_scoped_group_node(self):
+        driver = MagicMock()
+        session = MagicMock()
+        tx = MagicMock()
+        driver.session.return_value.__enter__.return_value = session
+        session.execute_write.side_effect = lambda operation: operation(tx)
+        published_group = {
+            "uid": "SCHOOL|2026|A02", "school_code": "SCHOOL", "academic_year": "2026",
+            "group_code": "A02", "name": "Group A02", "is_published": True,
+            "publication_revision": 2,
+        }
+        unpublished_group = {
+            "uid": "SCHOOL|2026|A01", "school_code": "SCHOOL", "academic_year": "2026",
+            "group_code": "A01", "publication_revision": 4,
+        }
+
+        sync_nodes_and_relationships(driver, "edugraph", {
+            "nodes": {
+                "Subject": [], "HighSchool": [{"code": "SCHOOL"}],
+                "SubjectGroup": [published_group],
+            },
+            "relationships": {"OFFERS_GROUP": [], "INCLUDES_SUBJECT": [], "IS_VARIANT_OF": []},
+            "unpublished_subject_groups": [unpublished_group],
+        })
+
+        delete_call = next(call for call in tx.run.call_args_list
+                           if "DETACH DELETE sg" in call.args[0])
+        self.assertIn("MATCH (sg:SubjectGroup {uid: row.uid})", delete_call.args[0])
+        self.assertIn("publication_revision, 0) <= row.publication_revision", delete_call.args[0])
+        self.assertEqual(delete_call.kwargs["rows"], [unpublished_group])
+        self.assertEqual(tx.run.call_count, 3)  # School, active group, and one scoped deletion.
+
+    def test_restore_projection_recreates_the_unpublished_uid_and_its_relationships(self):
+        driver = MagicMock()
+        session = MagicMock()
+        tx = MagicMock()
+        driver.session.return_value.__enter__.return_value = session
+        session.execute_write.side_effect = lambda operation: operation(tx)
+        uid = "SCHOOL|2026|A01"
+
+        sync_nodes_and_relationships(driver, "edugraph", {
+            "nodes": {"Subject": [], "HighSchool": [], "SubjectGroup": []},
+            "relationships": {"OFFERS_GROUP": [], "INCLUDES_SUBJECT": [], "IS_VARIANT_OF": []},
+            "unpublished_subject_groups": [{
+                "uid": uid, "school_code": "SCHOOL", "academic_year": "2026",
+                "group_code": "A01", "publication_revision": 2,
+            }],
+        })
+        tx.run.reset_mock()
+
+        sync_nodes_and_relationships(driver, "edugraph", {
+            "nodes": {
+                "Subject": [{"code": "MATH", "name": "Math", "subject_type": "ACADEMIC",
+                             "is_mandatory": False, "canonical_subject_code": None}],
+                "HighSchool": [{"code": "SCHOOL", "name": "School", "location": None}],
+                "SubjectGroup": [{"uid": uid, "school_code": "SCHOOL", "academic_year": "2026",
+                                  "group_code": "A01", "name": "Group A01", "is_published": True,
+                                  "publication_revision": 3}],
+            },
+            "relationships": {
+                "OFFERS_GROUP": [{"high_school_code": "SCHOOL", "subject_group_uid": uid,
+                                  "school_code": "SCHOOL", "academic_year": "2026", "group_code": "A01",
+                                  "group_name": "Group A01", "is_published": True,
+                                  "publication_revision": 3}],
+                "INCLUDES_SUBJECT": [{"subject_group_uid": uid, "subject_code": "MATH"}],
+                "IS_VARIANT_OF": [],
+            },
+            "unpublished_subject_groups": [],
+        })
+
+        group_upsert = next(call for call in tx.run.call_args_list
+                            if "MERGE (sg:SubjectGroup {uid: row.uid})" in call.args[0])
+        relation_upserts = [call.args[0] for call in tx.run.call_args_list]
+        self.assertEqual(group_upsert.kwargs["rows"][0]["uid"], uid)
+        self.assertTrue(any("MERGE (h)-[:OFFERS_GROUP]->(sg)" in query for query in relation_upserts))
+        self.assertTrue(any("MERGE (sg)-[r:INCLUDES_SUBJECT]->(s)" in query for query in relation_upserts))
+
+    def test_subject_group_projection_is_executed_as_one_transaction(self):
+        driver = MagicMock()
+        session = MagicMock()
+        tx = MagicMock()
+        driver.session.return_value.__enter__.return_value = session
+        session.execute_write.side_effect = lambda operation: operation(tx)
+
+        sync_nodes_and_relationships(driver, "edugraph", {
+            "nodes": {"Subject": [], "HighSchool": [], "SubjectGroup": []},
+            "relationships": {"OFFERS_GROUP": [], "INCLUDES_SUBJECT": [], "IS_VARIANT_OF": []},
+            "unpublished_subject_groups": [{
+                "uid": "SCHOOL|2026|A01", "school_code": "SCHOOL", "academic_year": "2026",
+                "group_code": "A01", "publication_revision": 2,
+            }],
+        })
+
+        session.execute_write.assert_called_once()
+        tx.run.assert_called_once_with(UNPUBLISHED_SUBJECT_GROUP_CYPHER, rows=[{
+            "uid": "SCHOOL|2026|A01", "school_code": "SCHOOL", "academic_year": "2026",
+            "group_code": "A01", "publication_revision": 2,
+        }])
+
+    def test_graph_orphan_statistics_ignore_unpublished_groups(self):
+        driver = MagicMock()
+        session = MagicMock()
+        driver.session.return_value.__enter__.return_value = session
+        session.run.return_value = MagicMock(single=MagicMock(return_value={"count": 0}))
+
+        verify_graph_statistics(driver, "edugraph")
+
+        group_orphan_query = next(call.args[0] for call in session.run.call_args_list
+                                  if "SubjectGroup" in call.args[0] and "OFFERS_GROUP" in call.args[0])
+        self.assertIn("coalesce(sg.is_published, true) = true", group_orphan_query)
 
 
 if __name__ == "__main__":

@@ -27,6 +27,7 @@ from graph_sync.neo4j_writer import (
     verify_graph_statistics,
     verify_neo4j_constraints,
 )
+from graph_sync.projection_lock import graph_projection_lock
 
 def load_env_file(env_path: str = ".env"):
     """Load environment variables from .env file into os.environ if present."""
@@ -41,6 +42,31 @@ def load_env_file(env_path: str = ".env"):
                     if line and not line.startswith("#") and "=" in line:
                         key, val = line.split("=", 1)
                         os.environ.setdefault(key.strip(), val.strip().strip('"\''))
+
+
+def read_and_validate_graph_data(database_url: str) -> Dict[str, Any]:
+    print("[1/5] Connecting to PostgreSQL (Read-Only mode)...")
+    try:
+        pg_conn = get_postgres_connection(database_url)
+    except Exception as error:
+        raise RuntimeError(f"Failed to connect to PostgreSQL: {error}") from error
+
+    try:
+        print("[2/5] Inspecting PostgreSQL schema via information_schema...")
+        valid_schema, schema_errors = verify_postgres_schema(pg_conn)
+        if not valid_schema:
+            raise ValueError("PostgreSQL schema validation failed: " + "; ".join(schema_errors))
+
+        print("[3/5] Extracting and normalizing PostgreSQL data...")
+        graph_data = fetch_all_graph_data_from_postgres(pg_conn)
+    finally:
+        pg_conn.close()
+
+    print("[4/5] Running graph data validation & integrity checks...")
+    is_valid, validation_errors = validate_graph_data(graph_data)
+    if not is_valid:
+        raise ValueError("Graph data validation failed: " + "; ".join(validation_errors))
+    return graph_data
 
 
 def main():
@@ -80,42 +106,15 @@ def main():
         print("Example: $env:DATABASE_URL=\"postgresql://user:password@localhost:5432/edu_guidance\"", file=sys.stderr)
         sys.exit(1)
 
-    print("[1/5] Connecting to PostgreSQL (Read-Only mode)...")
-    try:
-        pg_conn = get_postgres_connection(database_url)
-    except Exception as e:
-        print(f"[ERROR] Failed to connect to PostgreSQL: {e}", file=sys.stderr)
-        sys.exit(1)
-
-    try:
-        print("[2/5] Inspecting PostgreSQL schema via information_schema...")
-        valid_schema, schema_errors = verify_postgres_schema(pg_conn)
-        if not valid_schema:
-            print("[ERROR] PostgreSQL schema validation failed:", file=sys.stderr)
-            for err in schema_errors:
-                print(f"  - {err}", file=sys.stderr)
-            sys.exit(1)
-
-        print("[3/5] Extracting and normalizing PostgreSQL data...")
-        graph_data = fetch_all_graph_data_from_postgres(pg_conn)
-    finally:
-        pg_conn.close()
-
-    print("[4/5] Running graph data validation & integrity checks...")
-    is_valid, validation_errors = validate_graph_data(graph_data)
-
-    if not is_valid:
-        print("[ERROR] Graph Data Validation FAILED with errors:", file=sys.stderr)
-        for err in validation_errors:
-            print(f"  - {err}", file=sys.stderr)
-        if args.dry_run:
-            print_dry_run_summary(graph_data, is_valid=False)
-        sys.exit(1)
-
     if args.dry_run:
+        try:
+            graph_data = read_and_validate_graph_data(database_url)
+        except Exception as error:
+            print(f"[ERROR] {error}", file=sys.stderr)
+            sys.exit(1)
         print("\n=== DRY RUN VALIDATION SUCCESSFUL ===")
         print_dry_run_summary(graph_data, is_valid=True)
-        sys.exit(0)
+        return
 
     # Real Sync Mode
     if not neo4j_password:
@@ -137,15 +136,18 @@ def main():
                 print(f"  - {mc}", file=sys.stderr)
             sys.exit(1)
 
-        print(f"[*] Synchronizing data to Neo4j (database: '{neo4j_database}', batch_size: {args.batch_size})...")
-        sync_nodes_and_relationships(driver, neo4j_database, graph_data, batch_size=args.batch_size)
-        print("[SUCCESS] Data synchronization completed successfully.")
+        with graph_projection_lock(database_url):
+            # Read source state only after taking the same lock as lifecycle jobs.
+            graph_data = read_and_validate_graph_data(database_url)
+            print(f"[*] Synchronizing data to Neo4j (database: '{neo4j_database}', batch_size: {args.batch_size})...")
+            sync_nodes_and_relationships(driver, neo4j_database, graph_data, batch_size=args.batch_size)
+            print("[SUCCESS] Data synchronization completed successfully.")
 
-        print("\n[*] Running post-sync verification stats...")
-        stats = verify_graph_statistics(driver, neo4j_database)
-        print_verification_report(stats)
+            print("\n[*] Running post-sync verification stats...")
+            stats = verify_graph_statistics(driver, neo4j_database)
+            print_verification_report(stats)
 
-        check_reference_counts(stats, graph_data)
+            check_reference_counts(stats, graph_data)
     except Exception as e:
         print(f"[ERROR] Synchronization failed: {e}", file=sys.stderr)
         sys.exit(1)
@@ -160,6 +162,8 @@ def print_dry_run_summary(graph_data: Dict[str, Any], is_valid: bool):
     print("\n--- Summary of Extracted Node Counts ---")
     for label, items in nodes.items():
         print(f"  {label:<22}: {len(items):>5}")
+
+    print(f"  {'SubjectGroup deletions':<22}: {len(graph_data.get('unpublished_subject_groups', [])):>5}")
 
     print("\n--- Summary of Extracted Relationship Counts ---")
     for rel_type, items in rels.items():

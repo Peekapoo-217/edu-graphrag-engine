@@ -213,6 +213,8 @@ LIMIT $top_k
 | `combination` | Khối/tổ hợp môn |
 | `high_school` | Tên hoặc mã trường THPT |
 
+Khi có filter `high_school`, retriever lấy các nhóm môn của năm học mới nhất từ graph và chỉ giữ offer/tổ hợp có đầy đủ mọi môn yêu cầu trong nhóm đó hoặc trong danh sách môn bắt buộc. So sánh dùng `canonical_subject_code` khi có, nếu không dùng `code`. Các nhóm phù hợp được gắn trực tiếp vào từng tổ hợp tương ứng; chỉ trùng một môn không tạo kết quả phù hợp. Tổ hợp có yêu cầu bài thi năng khiếu không được xác nhận chỉ bằng nhóm môn THPT. Trường/ngành vẫn phải có cạnh `ACCEPTS_COMBINATION`; nhóm môn THPT không tự tạo admission offer. Kết quả này gợi ý tổ hợp môn, không khẳng định đủ điều kiện trúng tuyển.
+
 ### 5.4 `format_for_llm()` - Markdown Output
 
 ```markdown
@@ -220,10 +222,9 @@ LIMIT $top_k
 
 #### 1. Ngành: Kỹ thuật phần mềm (Mã ngành: 7480103) (Độ tương đồng Vector: 0.8542)
 - **Trường Đại học:** Đại học Quy Nhơn (DQN)
-- **Tổ hợp môn xét tuyển:** CHEMISTRY_MATH_PHYSICS (Toán, Lý, Hóa)
-  -> Các môn bắt buộc: Toán, Lý, Hóa
-- **Khuyên chọn Nhóm môn THPT:** Trường TCV - Nhóm môn: **Nhóm 1**
-  -> Các môn học thuộc nhóm môn THPT này: **Toán, Lý, Hóa**
+- **Tổ hợp môn xét tuyển:** CHEMISTRY_MATH_PHYSICS (Toán, Lý, Hóa) -> Môn yêu cầu: Toán, Lý, Hóa
+- **Nhóm môn THPT phù hợp:** Trường TCV - Nhóm 1 (Mã: A01, năm học 2026-2027) -> Môn trong nhóm: Toán, Lý, Hóa
+  - Phạm vi khớp chỉ là độ phủ môn học; không xác nhận thí sinh đủ điều kiện tuyển sinh.
 - **Lịch sử điểm chuẩn:**
   - Năm 2025 (Phương thức 100): Điểm THPT: **24.5**
 ```
@@ -329,3 +330,7 @@ curl -X POST http://localhost:8000/api/chat \
 `prompts/prompt_templates.py` chứa:
 - `SYSTEM_PROMPT` - System prompt chính
 - `QA_CONTEXT_PROMPT` - Template cho QA context (legacy/unused)
+
+## 11. Environment-only model configuration
+
+The RAG API and PDF extraction worker read `LLM_API_KEY`, `LLM_API_BASE`, and `LLM_MODEL` from their environment. Intent classification, chat answer generation, and document extraction remain distinct requests/flows, while using the configured model and provider. There is no internal endpoint for retrieving or overriding model configuration, and the backend admin UI cannot read or change these values. Keep the key in the local `.env` file and out of source control.

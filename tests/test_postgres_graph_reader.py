@@ -15,10 +15,15 @@ class PostgresGraphReaderTests(unittest.TestCase):
             queries.append(query)
             if "FROM subjects ORDER" in query:
                 rows = [("MATH", "Toán", "ACADEMIC", True, None)]
-            elif "FROM high_schools ORDER" in query:
-                rows = []
-            elif "FROM subject_groups ORDER" in query:
-                rows = []
+            elif "FROM high_schools" in query:
+                rows = [("SCHOOL", "School", "Province")]
+            elif "FROM subject_groups" in query:
+                rows = [
+                    ("SCHOOL", "2026-2027", "A01", "Group A01", "MATH", False, 9),
+                    ("SCHOOL", "2026-2027", "A02", "Group A02", "MATH", True, 3),
+                ]
+            elif "FROM admin.subject_group_publication_state" in query:
+                rows = [("SCHOOL", "2026-2027", "A01", 9)]
             elif "FROM universities ORDER" in query:
                 rows = [("DQN", "Đại học Quy Nhơn", None)]
             elif "FROM admission_offers o" in query:
@@ -50,6 +55,15 @@ class PostgresGraphReaderTests(unittest.TestCase):
         self.assertEqual(len(data["relationships"]["ACCEPTS_COMBINATION"]), 2)
         self.assertEqual(data["nodes"]["TrainingProgram"][0]["name"], "Ngành 101")
         self.assertEqual(data["nodes"]["CutoffScore"][0]["uid"], "DQN|2025|101|100|OFFICIAL_CUTOFF")
+        self.assertEqual([group["uid"] for group in data["nodes"]["SubjectGroup"]],
+                         ["SCHOOL|2026-2027|A02"])
+        self.assertEqual([relationship["subject_group_uid"]
+                          for relationship in data["relationships"]["OFFERS_GROUP"]],
+                         ["SCHOOL|2026-2027|A02"])
+        self.assertEqual(data["unpublished_subject_groups"], [{
+            "uid": "SCHOOL|2026-2027|A01", "school_code": "SCHOOL",
+            "academic_year": "2026-2027", "group_code": "A01", "publication_revision": 9,
+        }])
         self.assertTrue(any("JOIN offer_combinations oc ON oc.offer_id = o.id" in query for query in queries))
         self.assertTrue(any("JOIN majors m ON m.program_code = c.program_code" in query for query in queries))
 

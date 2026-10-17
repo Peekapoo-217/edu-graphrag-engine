@@ -99,11 +99,6 @@ class ChatRequest(BaseModel):
         default=None,
         description="Ngưỡng độ tương đồng tối thiểu cho vector search (mặc định từ settings.VECTOR_SIMILARITY_THRESHOLD = 0.65)"
     )
-    override_config: Optional[Dict[str, Any]] = Field(
-        default=None,
-        description="Cấu hình ghi đè tùy chọn từ client (api_key, model, base_url)"
-    )
-
     def get_conversation_context(self) -> List[Dict[str, str]]:
         """Return conversation context supporting both 'context' and legacy 'chat_history' fields."""
         if self.context and len(self.context) > 0:
@@ -154,10 +149,6 @@ async def chat_endpoint(request: ChatRequest) -> ChatResponse:
     # Step 1 & 2: Parse Intent & Query Routing
     try:
         active_parser = parser
-        intent_profile = _managed_llm_profile("INTENT")
-        if intent_profile:
-            active_parser = IntentParser(api_base=intent_profile["endpoint"],
-                                          api_key=intent_profile["apiKey"], model=intent_profile["model"])
         intent_result = active_parser.parse_intent(
             user_message=request.user_message,
             context=conversation_context
@@ -201,11 +192,6 @@ async def chat_endpoint(request: ChatRequest) -> ChatResponse:
     # Step 4: Generate LLM Answer
     try:
         active_generator = generator
-        chat_profile = _managed_llm_profile("CHAT")
-        if chat_profile:
-            active_generator = RAGGenerator(api_base=chat_profile["endpoint"],
-                                            api_key=chat_profile["apiKey"], model=chat_profile["model"])
-
         answer_text = active_generator.generate_answer(
             user_query=request.user_message,
             graph_context=formatted_context,
@@ -242,25 +228,6 @@ def _api_data(response: requests.Response) -> Any:
     response.raise_for_status()
     body = response.json()
     return body.get("data") if isinstance(body, dict) else None
-
-
-def _managed_llm_profile(purpose: str) -> Optional[Dict[str, str]]:
-    """Load a SUPER_ADMIN managed profile for this server-side purpose, never from the public request."""
-    if not settings.INTERNAL_SERVICE_TOKEN:
-        return None
-    try:
-        response = requests.get(
-            f"{settings.SUBJECT_PATHWAY_INTERNAL_API_URL}/api/v1/internal/llm/{purpose}",
-            headers={"X-Internal-Service-Token": settings.INTERNAL_SERVICE_TOKEN},
-            timeout=settings.SUBJECT_PATHWAY_API_TIMEOUT)
-        response.raise_for_status()
-        profile = response.json()
-        if not all(isinstance(profile.get(key), str) and profile[key] for key in ("endpoint", "model", "apiKey")):
-            raise ValueError("Invalid managed LLM profile")
-        return profile
-    except (requests.RequestException, ValueError, TypeError) as exc:
-        logger.error("Managed LLM profile unavailable for purpose %s (%s)", purpose, type(exc).__name__)
-        raise HTTPException(status_code=503, detail="Cấu hình dịch vụ AI hiện chưa sẵn sàng.") from exc
 
 
 def _recommend_subject_group(intent: Dict[str, Any]) -> ChatResponse:
@@ -324,7 +291,7 @@ def _recommend_subject_group(intent: Dict[str, Any]) -> ChatResponse:
                   "confidenceBySubjectCode": confidence_codes, "topK": 3}, timeout=timeout))
         rows = result.get("recommendations", []) if isinstance(result, dict) else []
         if not rows:
-            message = f"Mình chưa tìm thấy nhóm đủ 4 môn cho {school['name']} trong năm học {year}."
+            message = f"Mình chưa tìm thấy nhóm môn phù hợp cho {school['name']} trong năm học {year}."
         else:
             lines = [f"Gợi ý nhóm môn lớp 10 tại {school['name']} · năm học {year} (Top {len(rows)}):"]
             for index, row in enumerate(rows, 1):

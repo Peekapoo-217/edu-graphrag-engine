@@ -110,9 +110,12 @@ def fetch_all_graph_data_from_postgres(conn) -> Dict[str, Any]:
         "REQUIRES_APTITUDE": [...],   # AdmissionCombination → AptitudeTest
         "HAS_CUTOFF": [...],          # TrainingProgram → CutoffScore
     },
+    "unpublished_subject_groups": [...],  # UID nhóm có trạng thái công bố false, cần xóa node
     "raw_components": [...]  # Dữ liệu thô cho validation
 }
 ```
+
+Nhóm đang công bố được chiếu thành node `SubjectGroup` và các cạnh tương ứng. Nhóm có `is_published=false` không đi vào node/relationship projection; nó được đưa vào `unpublished_subject_groups` từ `admin.subject_group_publication_state` làm tombstone bền vững. Writer xóa bằng UID tham số hóa và kiểm tra thêm trường/năm/mã nhóm cùng `publication_revision`, rồi `DETACH DELETE` đúng node. Khóa duy nhất của SubjectGroup là UID `{school_code}|{academic_year}|{group_code}`, nên nhóm cùng mã ở trường khác không bị đụng tới.
 
 ## 5. `validators.py` - Kiểm tra tính toàn vẹn
 
@@ -258,4 +261,31 @@ Kiểm tra 4 loại orphan node:
 (:AdmissionCombination)-[:REQUIRES_SUBJECT {weight}]->(:Subject)
 (:AdmissionCombination)-[:REQUIRES_APTITUDE {weight}]->(:AptitudeTest)
 (:TrainingProgram)-[:HAS_CUTOFF]->(:CutoffScore)
+```
+
+## 8. Projection nhóm môn được SUPER_ADMIN công bố
+
+`graph_projection_worker.py` đồng bộ tăng dần các nhóm môn được công bố và thao tác CRUD trường THPT. Backend ghi nhóm môn và `admin.subject_group_graph_sync_jobs`, hoặc school change và `admin.high_school_graph_sync_jobs`, trong cùng PostgreSQL transaction. Worker claim hai hàng đợi bằng `FOR UPDATE SKIP LOCKED`. Mọi graph writer, gồm worker trường/tài liệu và lệnh full-sync, lấy cùng PostgreSQL advisory lock trước khi đọc trạng thái nguồn và giữ khóa đến khi ghi Neo4j hoàn tất. Một job chỉ là tín hiệu cần đối chiếu; trạng thái PostgreSQL hiện tại quyết định nhóm nào được MERGE và nhóm nào bị xóa. Vì vậy full-sync snapshot cũ không thể tạo lại node đã bị lifecycle job xóa. Writer thực hiện cập nhật nhóm trong một transaction Neo4j; job chỉ chuyển `SYNCED` sau khi graph transaction commit.
+
+Worker có thể chạy lại an toàn. Job lỗi được chuyển `RETRY` với exponential backoff tối đa 30 phút; lease `RUNNING` quá 10 phút được đưa lại hàng đợi sau khi worker khởi động lại. Error detail nội bộ không được lưu vào bảng, chỉ lưu `GRAPH_SYNC_FAILED`; stdout ghi `claimed`, `retry`, và `synced` cùng ID job/trường/tài liệu. Các nhóm môn hợp lệ có từ một đến bốn môn khác nhau. Chạy trong root Compose bằng service `graph-projection-worker`; cần `DATABASE_URL`, `NEO4J_URI`, `NEO4J_USERNAME`, `NEO4J_PASSWORD` và migration V12 đã được áp dụng. Soft-delete tài liệu không xóa graph; chỉ thao tác **Ngừng công bố** mới xóa node nhóm khi trạng thái hiệu lực PostgreSQL cho nhóm không còn nguồn công bố.
+
+## 9. Vòng đời công bố nhóm môn theo tài liệu
+
+V11 tạo `admin.subject_group_publication_state` theo khóa trường/năm/mã nhóm, có `is_published` và `publication_revision`; `admin.document_subject_group_sources` ghi nguồn tài liệu. Backfill chỉ gán nguồn khi audit publication và nhóm PostgreSQL khớp. Nhóm không xác minh được đánh dấu `UNATTRIBUTED`; API ngừng công bố trả HTTP 409 và không thay đổi trạng thái graph. V12 chỉ sửa source rows có thể ánh xạ không xung đột từ mã trường cũ sang mã hiện tại qua `admin.high_school_code_history`; các xung đột không tự suy đoán. Khi nhiều tài liệu cùng là nguồn của một nhóm, nhóm vẫn được công bố nếu còn ít nhất một nguồn đang công bố.
+
+Soft-delete chỉ đánh dấu tài liệu/bản nháp trong PostgreSQL và giữ object key trong MinIO. Nó không cập nhật trạng thái graph, nên nhóm vẫn tra cứu được. ADMIN tạo yêu cầu `DELETE_REQUESTED`; SUPER_ADMIN duyệt mới hoàn tất soft-delete, còn SUPER_ADMIN có thể xóa trực tiếp. `SUPER_ADMIN` có thể gọi API ngừng công bố với tài liệu đã soft-delete; PostgreSQL tính trạng thái hiệu lực rồi ghi outbox cùng transaction. Worker xóa node `SubjectGroup` và mọi cạnh nối vào node đó khi không còn nguồn tài liệu đang công bố. Nhóm còn nguồn công bố khác được giữ nguyên. Đồng bộ toàn bộ PostgreSQL → Neo4j áp dụng cùng trạng thái và xóa lại các node có tombstone. Thiếu provenance hoặc thiếu một nhóm đã công bố trong mapping sẽ trả HTTP 409 trước khi sửa trạng thái. Khôi phục kiểm tra tồn tại mọi object version, bật lại nguồn tài liệu, rồi dựng lại node/quan hệ bằng `MERGE` từ PostgreSQL; các node môn và trường dùng chung không bị xóa. PostgreSQL advisory lock được dùng chung giữa worker và full-sync để job cũ không tạo lại node sau khi trạng thái mới hơn đã được áp dụng. Lặp lại restore dùng lại job đã ghi audit.
+
+Worker ghi tiến độ ra stdout để xem ngay khi chạy foreground hoặc theo dõi service Compose:
+
+```text
+[graph-sync] claimed job=<id> document=<id> school=<code> year=<year>
+[graph-sync] retry job=<id> document=<id> error=<type> delay_seconds=<seconds>
+[graph-sync] synced job=<id> document=<id>
+[graph-sync] claimed school-job=<id> school=<code> operation=<operation>
+[graph-sync] retry school-job=<id> school=<code> error=<type> delay_seconds=<seconds>
+[graph-sync] synced school-job=<id> school=<code>
+```
+
+```powershell
+docker compose logs -f graph-projection-worker
 ```

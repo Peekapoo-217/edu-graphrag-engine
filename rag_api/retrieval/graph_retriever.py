@@ -25,6 +25,70 @@ from rag_api.utils.config import settings
 from rag_api.utils.logger import logger
 
 
+SCHOOL_GROUPS_QUERY = """
+    MATCH (hs:HighSchool)-[:OFFERS_GROUP]->(sg:SubjectGroup)-[:INCLUDES_SUBJECT]->(subject:Subject)
+    WHERE toLower(hs.name) CONTAINS $high_school_name
+       OR hs.code = $high_school_code
+    WITH hs, sg, subject
+    WHERE coalesce(sg.is_published, true) = true
+    WITH hs, sg,
+         collect(DISTINCT {code: subject.code,
+                           canonical_code: coalesce(subject.canonical_subject_code, subject.code),
+                           name: subject.name}) AS subjects
+    RETURN hs.code AS high_school_code,
+           hs.name AS high_school_name,
+           sg.academic_year AS academic_year,
+           sg.group_code AS subject_group_code,
+           sg.name AS subject_group_name,
+           subjects
+    ORDER BY high_school_code, academic_year DESC, subject_group_code
+"""
+
+MANDATORY_SUBJECTS_QUERY = """
+    MATCH (subject:Subject)
+    WHERE subject.is_mandatory = true
+    RETURN collect(DISTINCT coalesce(subject.canonical_subject_code, subject.code)) AS subject_codes
+"""
+
+
+def _canonical_subject_code(value: Any) -> Optional[str]:
+    if isinstance(value, dict):
+        value = value.get("canonical_code") or value.get("canonical_subject_code") or value.get("code")
+    if not isinstance(value, str) or not value.strip():
+        return None
+    return value.strip().casefold()
+
+
+def _matching_school_groups(required_subject_codes: List[str], groups: List[Dict[str, Any]],
+                            mandatory_subject_codes: List[str]) -> List[Dict[str, Any]]:
+    """Return latest-year school groups that cover every subject in an admission combination."""
+    required = {_canonical_subject_code(code) for code in required_subject_codes}
+    required.discard(None)
+    if not required:
+        return []
+
+    mandatory = {_canonical_subject_code(code) for code in mandatory_subject_codes}
+    mandatory.discard(None)
+    latest_year_by_school: Dict[str, str] = {}
+    for group in groups:
+        school_code = str(group.get("high_school_code") or "")
+        academic_year = str(group.get("academic_year") or "")
+        if school_code and academic_year > latest_year_by_school.get(school_code, ""):
+            latest_year_by_school[school_code] = academic_year
+
+    matches = []
+    for group in groups:
+        school_code = str(group.get("high_school_code") or "")
+        if not school_code or group.get("academic_year") != latest_year_by_school.get(school_code):
+            continue
+        subjects = group.get("subjects") or []
+        offered = {_canonical_subject_code(subject) for subject in subjects}
+        offered.discard(None)
+        if required.issubset(offered | mandatory):
+            matches.append(group)
+    return matches
+
+
 class Neo4jRetriever:
     """Hybrid GraphRAG Retriever combining Neo4j Vector Search and Multi-hop Traversal down to High School data."""
 
@@ -146,19 +210,6 @@ class Neo4jRetriever:
         if keyword:
             vector = self._get_embedding(keyword)
 
-        # Soft MATCH clause for optional HighSchool & SubjectGroup filtering with detailed subjects
-        hs_match_clause = ""
-        hs_return_clause = ""
-        hs_with_clause = ""
-        if high_school:
-            hs_match_clause = """
-            MATCH (hs:HighSchool)-[:OFFERS_GROUP]->(sg:SubjectGroup)-[:INCLUDES_SUBJECT]->(s)
-            WHERE ($high_school IS NULL OR toLower(hs.name) CONTAINS toLower($high_school) OR toLower(hs.code) CONTAINS toLower($high_school))
-            OPTIONAL MATCH (sg)-[:INCLUDES_SUBJECT]->(all_sg_subj:Subject)
-            """
-            hs_with_clause = ", hs, sg, collect(DISTINCT all_sg_subj.name) AS group_subjects"
-            hs_return_clause = ", hs.name AS high_school_name, sg.name AS subject_group_name, sg.group_code AS subject_group_code, group_subjects"
-
         # Build dynamic WHERE clauses for hard filters
         combination_filter = ""
         score_max_filter = ""
@@ -187,9 +238,10 @@ class Neo4jRetriever:
                 WHERE cs.cutoff_score_thpt IS NOT NULL AND cs.cutoff_score_thpt <= $score_max
                 """
 
+        candidate_limit = min(max(top_k, 1) * (10 if high_school else 1), 100)
         if vector:
             cypher_query = f"""
-            CALL db.index.vector.queryNodes('program_vector_index', $top_k, $vector) YIELD node AS p, score AS similarity_score
+            CALL db.index.vector.queryNodes('program_vector_index', $candidate_limit, $vector) YIELD node AS p, score AS similarity_score
             WHERE similarity_score >= $score_threshold
             MATCH (u:University)-[:OFFERS_PROGRAM]->(p)
             WHERE ($university IS NULL OR toLower(u.name) CONTAINS toLower($university) OR toLower(u.code) CONTAINS toLower($university))
@@ -201,13 +253,14 @@ class Neo4jRetriever:
             WHERE ($combination IS NULL OR c.id = $combination)
 
             OPTIONAL MATCH (c)-[r_req:REQUIRES_SUBJECT]->(s:Subject)
-
-            {hs_match_clause}
+            OPTIONAL MATCH (c)-[:REQUIRES_APTITUDE]->(apt:AptitudeTest)
 
             OPTIONAL MATCH (p)-[:HAS_CUTOFF]->(cs:CutoffScore)
 
-            WITH u, p, similarity_score, c, r_acc {hs_with_clause},
+            WITH u, p, similarity_score, c, r_acc,
                  collect(DISTINCT s.name) AS required_subjects,
+                 collect(DISTINCT coalesce(s.canonical_subject_code, s.code)) AS required_subject_codes,
+                 collect(DISTINCT apt.code) AS required_aptitude_codes,
                  collect(DISTINCT {{
                      admission_year: cs.admission_year,
                      score_thpt: cs.cutoff_score_thpt,
@@ -223,11 +276,12 @@ class Neo4jRetriever:
                 c.id AS combination_id,
                 c.display_name AS combination_name,
                 required_subjects,
+                required_subject_codes,
+                required_aptitude_codes,
                 cutoff_scores,
                 similarity_score AS score
-                {hs_return_clause}
             ORDER BY score DESC
-            LIMIT $top_k
+            LIMIT $candidate_limit
             """
         else:
             cypher_query = f"""
@@ -242,13 +296,14 @@ class Neo4jRetriever:
             WHERE ($combination IS NULL OR c.id = $combination)
 
             OPTIONAL MATCH (c)-[r_req:REQUIRES_SUBJECT]->(s:Subject)
-
-            {hs_match_clause}
+            OPTIONAL MATCH (c)-[:REQUIRES_APTITUDE]->(apt:AptitudeTest)
 
             OPTIONAL MATCH (p)-[:HAS_CUTOFF]->(cs:CutoffScore)
 
-            WITH u, p, c, r_acc {hs_with_clause},
+            WITH u, p, c, r_acc,
                  collect(DISTINCT s.name) AS required_subjects,
+                 collect(DISTINCT coalesce(s.canonical_subject_code, s.code)) AS required_subject_codes,
+                 collect(DISTINCT apt.code) AS required_aptitude_codes,
                  collect(DISTINCT {{
                      admission_year: cs.admission_year,
                      score_thpt: cs.cutoff_score_thpt,
@@ -264,30 +319,40 @@ class Neo4jRetriever:
                 c.id AS combination_id,
                 c.display_name AS combination_name,
                 required_subjects,
+                required_subject_codes,
+                required_aptitude_codes,
                 cutoff_scores,
                 1.0 AS score
-                {hs_return_clause}
-            LIMIT $top_k
+            LIMIT $candidate_limit
             """
 
         query_params = {
-            "top_k": top_k,
+            "candidate_limit": candidate_limit,
             "vector": vector if vector else [],
             "keyword": keyword,
             "university": university,
             "score_max": score_max,
             "combination": combination,
-            "high_school": high_school,
             "score_threshold": threshold
         }
 
         records: List[Dict[str, Any]] = []
+        school_groups: List[Dict[str, Any]] = []
+        mandatory_subject_codes: List[str] = []
         try:
             driver = self.get_driver()
             with driver.session(database=self.database) as session:
                 result = session.run(cypher_query, **query_params)
                 for record in result:
                     records.append(record.data())
+                if high_school:
+                    school_groups = [record.data() for record in session.run(
+                        SCHOOL_GROUPS_QUERY,
+                        high_school_name=high_school.casefold(),
+                        high_school_code=high_school.strip().upper())]
+                    mandatory_record = session.run(MANDATORY_SUBJECTS_QUERY).single()
+                    if mandatory_record:
+                        mandatory_subject_codes = mandatory_record.get("subject_codes") or []
         except Exception as e:
             logger.error(f"Error executing Neo4j retrieval Cypher query: {e}")
             return []
@@ -295,26 +360,63 @@ class Neo4jRetriever:
         # Deduplicate by program UID (university_code|program_code) and merge combinations
         deduped = {}
         for r in records:
+            matching_groups = []
+            if high_school:
+                if r.get("required_aptitude_codes"):
+                    continue
+                matching_groups = _matching_school_groups(
+                    r.get("required_subject_codes") or [], school_groups, mandatory_subject_codes)
+                if not matching_groups:
+                    continue
+                r["matching_subject_groups"] = matching_groups
+                first_group = matching_groups[0]
+                r["high_school_name"] = first_group.get("high_school_name")
+                r["subject_group_name"] = first_group.get("subject_group_name")
+                r["subject_group_code"] = first_group.get("subject_group_code")
+                r["group_subjects"] = [subject.get("name", "") for subject in first_group.get("subjects", [])]
+
             univ_code = r.get("university_code")
             prog_code = r.get("program_code")
             if not univ_code or not prog_code:
                 continue
             uid = f"{univ_code}|{prog_code}"
+            combination = None
+            comb_id = r.get("combination_id")
+            if comb_id:
+                combination = {
+                    "id": comb_id,
+                    "display_name": r.get("combination_name"),
+                    "required_subjects": r.get("required_subjects") or [],
+                    "required_subject_codes": r.get("required_subject_codes") or [],
+                    "matching_subject_groups": matching_groups,
+                }
             if uid not in deduped:
                 deduped[uid] = r
-                # Initialize combinations list
-                comb_id = r.get("combination_id")
-                comb_name = r.get("combination_name")
-                if comb_id:
-                    deduped[uid]["combinations"] = [{"id": comb_id, "display_name": comb_name}]
-                else:
-                    deduped[uid]["combinations"] = []
+                deduped[uid]["combinations"] = [combination] if combination else []
+                deduped[uid]["matching_subject_groups"] = matching_groups
             else:
-                # Merge additional combination
-                comb_id = r.get("combination_id")
-                comb_name = r.get("combination_name")
-                if comb_id and comb_id not in [c["id"] for c in deduped[uid]["combinations"]]:
-                    deduped[uid]["combinations"].append({"id": comb_id, "display_name": comb_name})
+                current = deduped[uid]
+                if combination:
+                    existing_combination = next((item for item in current["combinations"] if item["id"] == comb_id), None)
+                    if existing_combination is None:
+                        current["combinations"].append(combination)
+                    else:
+                        existing_group_keys = {
+                            (item.get("high_school_code"), item.get("academic_year"), item.get("subject_group_code"))
+                            for item in existing_combination.get("matching_subject_groups", [])
+                        }
+                        for group in matching_groups:
+                            group_key = (group.get("high_school_code"), group.get("academic_year"), group.get("subject_group_code"))
+                            if group_key not in existing_group_keys:
+                                existing_combination["matching_subject_groups"].append(group)
+                                existing_group_keys.add(group_key)
+                current_groups = {(item.get("high_school_code"), item.get("academic_year"), item.get("subject_group_code"))
+                                  for item in current.get("matching_subject_groups", [])}
+                for group in matching_groups:
+                    group_key = (group.get("high_school_code"), group.get("academic_year"), group.get("subject_group_code"))
+                    if group_key not in current_groups:
+                        current["matching_subject_groups"].append(group)
+                        current_groups.add(group_key)
 
         # Convert back to list, keep first combination as primary for backward compatibility
         final_records = []
@@ -326,7 +428,7 @@ class Neo4jRetriever:
                 r["combination_name"] = primary["display_name"]
             final_records.append(r)
 
-        return final_records
+        return final_records[:top_k]
 
     def format_for_llm(self, records: List[Dict[str, Any]]) -> str:
         """
@@ -354,22 +456,30 @@ class Neo4jRetriever:
             lines.append(f"#### {idx}. Ngành: {prog_name} (Mã ngành: {prog_code}){score_str}")
             lines.append(f"- **Trường Đại học:** {univ_name} ({univ_code})")
 
-            # Combinations & Required Subjects
-            comb_id = rec.get("combination_id")
-            comb_name = rec.get("combination_name")
-            req_subjs = rec.get("required_subjects", [])
-            if comb_id or comb_name:
-                subj_info = f" -> Các môn bắt buộc: {', '.join(req_subjs)}" if req_subjs else ""
-                lines.append(f"- **Tổ hợp môn xét tuyển:** {comb_id or ''} ({comb_name or ''}){subj_info}")
-
-            # High School & Subject Group info with detailed subjects list
-            hs_name = rec.get("high_school_name")
-            sg_name = rec.get("subject_group_name")
-            sg_code = rec.get("subject_group_code")
-            grp_subjs = rec.get("group_subjects", [])
-            if hs_name or sg_name:
-                subj_list_str = f" -> Các môn học thuộc nhóm môn THPT này: **{', '.join(grp_subjs)}**" if grp_subjs else ""
-                lines.append(f"- **Khuyên chọn Nhóm môn THPT:** {hs_name or 'Trường THPT'} - Nhóm môn: **{sg_name or ''}** (Mã nhóm: {sg_code or 'N/A'}){subj_list_str}")
+            # Admission combinations retained here have been checked against every
+            # required subject when a high-school filter is present.
+            combinations = rec.get("combinations") or []
+            if not combinations and rec.get("combination_id"):
+                combinations = [{"id": rec.get("combination_id"),
+                                 "display_name": rec.get("combination_name"),
+                                 "required_subjects": rec.get("required_subjects", [])}]
+            for item in combinations:
+                required = item.get("required_subjects", [])
+                subj_info = f" -> Môn yêu cầu: {', '.join(required)}" if required else ""
+                lines.append(f"- **Tổ hợp môn xét tuyển:** {item.get('id') or ''} ({item.get('display_name') or ''}){subj_info}")
+                groups = item.get("matching_subject_groups") or []
+                if not groups and (rec.get("high_school_name") or rec.get("subject_group_name")):
+                    groups = [{"high_school_name": rec.get("high_school_name"),
+                               "subject_group_name": rec.get("subject_group_name"),
+                               "subject_group_code": rec.get("subject_group_code"),
+                               "subjects": [{"name": name} for name in rec.get("group_subjects", [])]}]
+                for group in groups:
+                    group_subjects = [subject.get("name", "") for subject in group.get("subjects", [])]
+                    subj_list = f" -> Môn trong nhóm: **{', '.join(group_subjects)}**" if group_subjects else ""
+                    lines.append(f"  - Nhóm môn phù hợp: {group.get('high_school_name') or 'Trường THPT'} - "
+                                 f"{group.get('subject_group_name') or ''} (Mã: {group.get('subject_group_code') or 'N/A'}, "
+                                 f"năm học {group.get('academic_year') or 'không rõ'}){subj_list}")
+                    lines.append("  - Phạm vi khớp chỉ là độ phủ môn học; không xác nhận thí sinh đủ điều kiện tuyển sinh.")
 
             # Cutoff Scores
             cutoffs = rec.get("cutoff_scores", [])

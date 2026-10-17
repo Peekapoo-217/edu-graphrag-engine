@@ -46,6 +46,25 @@ def validate_graph_data(graph_data: Dict[str, Any]) -> Tuple[bool, List[str]]:
             errors.append(f"Duplicate SubjectGroup uid: '{uid}'")
         subject_group_uids.add(uid)
 
+    unpublished_group_uids: Set[str] = set()
+    for group in graph_data.get("unpublished_subject_groups", []):
+        uid = group.get("uid")
+        if not isinstance(uid, str) or not uid.strip():
+            errors.append("Unpublished SubjectGroup is missing a valid uid")
+            continue
+        if uid in unpublished_group_uids:
+            errors.append(f"Duplicate unpublished SubjectGroup uid: '{uid}'")
+        if uid in subject_group_uids:
+            errors.append(f"SubjectGroup cannot be both published and deleted: '{uid}'")
+        unpublished_group_uids.add(uid)
+        if not group.get("school_code") or not group.get("academic_year") or not group.get("group_code"):
+            errors.append(f"Unpublished SubjectGroup '{uid}' is missing its school/year/group scope")
+        elif uid != f"{group['school_code']}|{group['academic_year']}|{group['group_code']}":
+            errors.append(f"Unpublished SubjectGroup '{uid}' does not match its school/year/group scope")
+        revision = group.get("publication_revision")
+        if not isinstance(revision, int) or revision < 1:
+            errors.append(f"Unpublished SubjectGroup '{uid}' has an invalid publication revision")
+
     # University duplicates
     for u in nodes["University"]:
         code = u["code"]

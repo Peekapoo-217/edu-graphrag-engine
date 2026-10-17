@@ -74,9 +74,6 @@ class Settings:
     API_PORT: int = int(os.getenv("API_PORT", "8000"))
     SUBJECT_PATHWAY_API_URL: str = os.getenv("SUBJECT_PATHWAY_API_URL", "http://localhost:8080").rstrip("/")
     SUBJECT_PATHWAY_API_TIMEOUT: float = float(os.getenv("SUBJECT_PATHWAY_API_TIMEOUT", "8.0"))
-    SUBJECT_PATHWAY_INTERNAL_API_URL: str = os.getenv("SUBJECT_PATHWAY_INTERNAL_API_URL", "http://localhost:8080").rstrip("/")
-    INTERNAL_SERVICE_TOKEN: Optional[str] = os.getenv("INTERNAL_SERVICE_TOKEN")
-
     # Ollama Embedding Settings
     OLLAMA_HOST: str = os.getenv("OLLAMA_HOST", "")
     OLLAMA_EMBED_MODEL: str = os.getenv("OLLAMA_EMBED_MODEL", "")

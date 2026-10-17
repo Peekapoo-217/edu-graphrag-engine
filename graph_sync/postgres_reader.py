@@ -14,8 +14,8 @@ from .models import (
 
 REQUIRED_POSTGRES_SCHEMA: Dict[str, List[str]] = {
     "subjects": ["code", "name", "subject_type", "is_mandatory", "canonical_subject_code"],
-    "high_schools": ["code", "name", "location"],
-    "subject_groups": ["school_code", "academic_year", "group_code", "group_name", "subject_code"],
+    "high_schools": ["code", "name", "location", "deleted_at"],
+    "subject_groups": ["school_code", "academic_year", "group_code", "group_name", "subject_code", "deleted_at"],
     "universities": ["university_code", "university_name", "website"],
     "majors": ["program_code", "program_name"],
     "admission_offers": [
@@ -96,22 +96,38 @@ def fetch_all_graph_data_from_postgres(conn: psycopg.Connection) -> Dict[str, An
                 })
 
         # 2. High Schools
-        cur.execute("SELECT code, name, location FROM high_schools ORDER BY code;")
+        cur.execute("SELECT code, name, location FROM high_schools WHERE deleted_at IS NULL ORDER BY code;")
         high_schools = [
             {"code": r[0], "name": r[1], "location": r[2]}
             for r in cur.fetchall()
         ]
 
         # 3. Subject Groups & Relations
-        cur.execute("SELECT school_code, academic_year, group_code, group_name, subject_code FROM subject_groups ORDER BY school_code, academic_year, group_code;")
+        cur.execute("SELECT sg.school_code, sg.academic_year, sg.group_code, sg.group_name, sg.subject_code, "
+                    "coalesce(state.is_published, true), coalesce(state.publication_revision, 1) "
+                    "FROM subject_groups sg LEFT JOIN admin.subject_group_publication_state state "
+                    "ON state.school_code=sg.school_code AND state.academic_year=sg.academic_year "
+                    "AND state.group_code=upper(sg.group_code) "
+                    "WHERE sg.deleted_at IS NULL ORDER BY sg.school_code, sg.academic_year, sg.group_code;")
         sg_rows = cur.fetchall()
         
         subject_groups_map: Dict[str, Dict[str, Any]] = {}
         includes_subject_relations: List[Dict[str, Any]] = []
-        offers_group_relations_set = set()
+        offers_group_relations_by_key = {}
+        unpublished_subject_groups_by_uid: Dict[str, Dict[str, Any]] = {}
 
-        for school_code, academic_year, group_code, group_name, subject_code in sg_rows:
+        for school_code, academic_year, group_code, group_name, subject_code, is_published, publication_revision in sg_rows:
             uid = make_subject_group_uid(school_code, str(academic_year), group_code)
+            if not bool(is_published):
+                unpublished_subject_groups_by_uid[uid] = {
+                    "uid": uid,
+                    "school_code": school_code,
+                    "academic_year": str(academic_year),
+                    "group_code": group_code,
+                    "publication_revision": int(publication_revision),
+                }
+                continue
+
             if uid not in subject_groups_map:
                 subject_groups_map[uid] = {
                     "uid": uid,
@@ -119,18 +135,44 @@ def fetch_all_graph_data_from_postgres(conn: psycopg.Connection) -> Dict[str, An
                     "academic_year": str(academic_year),
                     "group_code": group_code,
                     "name": group_name,
+                    "is_published": bool(is_published),
+                    "publication_revision": int(publication_revision),
                 }
-            offers_group_relations_set.add((school_code, uid))
+            offers_group_relations_by_key[(school_code, uid)] = {
+                "high_school_code": school_code,
+                "subject_group_uid": uid,
+                "school_code": school_code,
+                "academic_year": str(academic_year),
+                "group_code": group_code,
+                "group_name": group_name,
+                "is_published": bool(is_published),
+                "publication_revision": int(publication_revision),
+            }
             includes_subject_relations.append({
                 "subject_group_uid": uid,
                 "subject_code": subject_code,
             })
 
+        # Publication-state rows are durable PostgreSQL tombstones. Read these
+        # independently so a removed source row cannot leave a stale graph node.
+        cur.execute(
+            "SELECT school_code, academic_year, group_code, publication_revision "
+            "FROM admin.subject_group_publication_state WHERE is_published=false "
+            "ORDER BY school_code, academic_year, group_code;"
+        )
+        for school_code, academic_year, group_code, publication_revision in cur.fetchall():
+            uid = make_subject_group_uid(school_code, str(academic_year), group_code)
+            unpublished_subject_groups_by_uid[uid] = {
+                "uid": uid,
+                "school_code": school_code,
+                "academic_year": str(academic_year),
+                "group_code": group_code,
+                "publication_revision": int(publication_revision),
+            }
+
         subject_groups = list(subject_groups_map.values())
-        offers_group_relations = [
-            {"high_school_code": hs_code, "subject_group_uid": sg_uid}
-            for hs_code, sg_uid in sorted(offers_group_relations_set)
-        ]
+        offers_group_relations = [offers_group_relations_by_key[key]
+                                  for key in sorted(offers_group_relations_by_key)]
 
         # 4. Universities
         cur.execute("SELECT university_code, university_name, website FROM universities ORDER BY university_code;")
@@ -284,5 +326,6 @@ def fetch_all_graph_data_from_postgres(conn: psycopg.Connection) -> Dict[str, An
             "REQUIRES_APTITUDE": requires_aptitude_relations,
             "HAS_CUTOFF": has_cutoff_relations,
         },
+        "unpublished_subject_groups": list(unpublished_subject_groups_by_uid.values()),
         "raw_components": comp_rows,
     }

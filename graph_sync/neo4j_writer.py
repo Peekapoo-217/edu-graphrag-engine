@@ -34,10 +34,14 @@ NODE_CYPHER_STATEMENTS: Dict[str, str] = {
     "SubjectGroup": """
         UNWIND $rows AS row
         MERGE (sg:SubjectGroup {uid: row.uid})
+        WITH sg, row
+        WHERE coalesce(sg.publication_revision, 0) <= row.publication_revision
         SET sg.school_code = row.school_code,
             sg.academic_year = row.academic_year,
             sg.group_code = row.group_code,
-            sg.name = row.name
+            sg.name = row.name,
+            sg.is_published = row.is_published,
+            sg.publication_revision = row.publication_revision
     """,
     "University": """
         UNWIND $rows AS row
@@ -81,8 +85,22 @@ RELATIONSHIP_CYPHER_STATEMENTS: Dict[str, str] = {
     "OFFERS_GROUP": """
         UNWIND $rows AS row
         MATCH (h:HighSchool {code: row.high_school_code})
-        MATCH (sg:SubjectGroup {uid: row.subject_group_uid})
-        MERGE (h)-[r:OFFERS_GROUP]->(sg)
+        MERGE (sg:SubjectGroup {uid: row.subject_group_uid})
+        SET sg.publication_revision = coalesce(sg.publication_revision, 0)
+        WITH h, sg, row
+        WHERE sg.publication_revision <= row.publication_revision
+        SET sg.school_code = row.school_code,
+            sg.academic_year = row.academic_year,
+            sg.group_code = row.group_code,
+            sg.name = row.group_name,
+            sg.is_published = row.is_published,
+            sg.publication_revision = row.publication_revision
+        WITH h, sg, row
+        OPTIONAL MATCH (h)-[existing:OFFERS_GROUP]->(sg)
+        FOREACH (_ IN CASE WHEN row.is_published THEN [1] ELSE [] END |
+            MERGE (h)-[:OFFERS_GROUP]->(sg))
+        FOREACH (_ IN CASE WHEN NOT row.is_published AND existing IS NOT NULL THEN [1] ELSE [] END |
+            DELETE existing)
     """,
     "INCLUDES_SUBJECT": """
         UNWIND $rows AS row
@@ -194,7 +212,6 @@ def sync_nodes_and_relationships(
     node_order = [
         "Subject",
         "HighSchool",
-        "SubjectGroup",
         "University",
         "TrainingProgram",
         "AdmissionCombination",
@@ -215,6 +232,21 @@ def sync_nodes_and_relationships(
 
     nodes_data = graph_data["nodes"]
     rels_data = graph_data["relationships"]
+
+    group_node_labels = {"Subject", "HighSchool", "SubjectGroup"}
+    group_relationship_types = {"OFFERS_GROUP", "INCLUDES_SUBJECT", "IS_VARIANT_OF"}
+    has_group_projection = (
+        "unpublished_subject_groups" in graph_data
+        or any(label in nodes_data for label in group_node_labels)
+        or any(rel_type in rels_data for rel_type in group_relationship_types)
+    )
+
+    if has_group_projection:
+        sync_subject_group_projection(driver, database, graph_data, batch_size)
+        nodes_data = {label: rows for label, rows in nodes_data.items()
+                      if label not in group_node_labels}
+        rels_data = {rel_type: rows for rel_type, rows in rels_data.items()
+                     if rel_type not in group_relationship_types}
 
     with driver.session(database=database) as session:
         # Sync Nodes
@@ -244,6 +276,50 @@ def sync_nodes_and_relationships(
                 raise RuntimeError(f"Error during Relationship Sync stage '{rel_type}': {e}") from e
 
 
+UNPUBLISHED_SUBJECT_GROUP_CYPHER = """
+    UNWIND $rows AS row
+    MATCH (sg:SubjectGroup {uid: row.uid})
+    WHERE sg.school_code = row.school_code
+      AND sg.academic_year = row.academic_year
+      AND sg.group_code = row.group_code
+      AND coalesce(sg.publication_revision, 0) <= row.publication_revision
+    DETACH DELETE sg
+"""
+
+
+def sync_subject_group_projection(
+    driver: neo4j.Driver,
+    database: str,
+    graph_data: Dict[str, Any],
+    batch_size: int = 500,
+) -> None:
+    """Atomically upsert published school groups and remove unpublished group nodes."""
+    nodes_data = graph_data["nodes"]
+    rels_data = graph_data["relationships"]
+
+    def apply_projection(tx: Any) -> None:
+        for label in ("Subject", "HighSchool", "SubjectGroup"):
+            rows = nodes_data.get(label, [])
+            if not rows:
+                continue
+            for chunk in chunk_list(rows, batch_size):
+                tx.run(NODE_CYPHER_STATEMENTS[label], rows=chunk).consume()
+
+        for rel_type in ("OFFERS_GROUP", "INCLUDES_SUBJECT", "IS_VARIANT_OF"):
+            rows = rels_data.get(rel_type, [])
+            if not rows:
+                continue
+            for chunk in chunk_list(rows, batch_size):
+                tx.run(RELATIONSHIP_CYPHER_STATEMENTS[rel_type], rows=chunk).consume()
+
+        unpublished_groups = graph_data.get("unpublished_subject_groups", [])
+        for chunk in chunk_list(unpublished_groups, batch_size):
+            tx.run(UNPUBLISHED_SUBJECT_GROUP_CYPHER, rows=chunk).consume()
+
+    with driver.session(database=database) as session:
+        session.execute_write(apply_projection)
+
+
 def verify_graph_statistics(driver: neo4j.Driver, database: str) -> Dict[str, Any]:
     """
     Execute statistical and orphan checks in Neo4j and return verification results.
@@ -264,9 +340,16 @@ def verify_graph_statistics(driver: neo4j.Driver, database: str) -> Dict[str, An
             rel_counts[record["relationship"]] = record["total"]
 
         # Orphan node checks
-        # SubjectGroup without HighSchool
-        res_sg = session.run("MATCH (sg:SubjectGroup) WHERE NOT ()-[:OFFERS_GROUP]->(sg) RETURN count(sg) AS count;")
+        # Unpublished groups intentionally have no school relation in Neo4j.
+        res_sg = session.run("MATCH (sg:SubjectGroup) WHERE coalesce(sg.is_published, true) = true "
+                             "AND NOT ()-[:OFFERS_GROUP]->(sg) RETURN count(sg) AS count;")
         orphans["SubjectGroup_without_HighSchool"] = res_sg.single()["count"]
+
+        res_unpublished_sg = session.run(
+            "MATCH (sg:SubjectGroup) WHERE coalesce(sg.is_published, true) = false "
+            "RETURN count(sg) AS count;"
+        )
+        orphans["Unpublished_SubjectGroup_remaining"] = res_unpublished_sg.single()["count"]
 
         # TrainingProgram without University
         res_tp = session.run("MATCH (tp:TrainingProgram) WHERE NOT ()-[:OFFERS_PROGRAM]->(tp) RETURN count(tp) AS count;")
