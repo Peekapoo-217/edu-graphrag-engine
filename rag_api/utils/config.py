@@ -68,6 +68,9 @@ class Settings:
     LLM_MODEL: str = os.getenv("LLM_MODEL", "")
     LLM_MODEL_NAME: str = os.getenv("LLM_MODEL_NAME", "")
     LLM_TIMEOUT: float = float(os.getenv("LLM_TIMEOUT", "30.0"))
+    # Intent parsing has a measured latency profile distinct from answer generation.
+    # Keep the legacy timeout as the fallback for existing deployments.
+    INTENT_PARSER_TIMEOUT: float = float(os.getenv("INTENT_PARSER_TIMEOUT", os.getenv("LLM_TIMEOUT", "30.0")))
 
     # API Server Settings
     API_HOST: str = os.getenv("API_HOST", "0.0.0.0")

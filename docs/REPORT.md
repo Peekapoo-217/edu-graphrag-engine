@@ -247,3 +247,70 @@ Worker projection cần backend áp dụng Flyway V8 và database/Neo4j đang ho
 - [x] Bỏ nhóm đã ngừng công bố khỏi chẩn đoán orphan; full sync lấy trạng thái hiện tại từ PostgreSQL để hội tụ lại graph.
 - [x] Kiểm thử: `python -m unittest discover -s tests` (80 test đạt).
 - [ ] Chưa xác minh truy vấn trên Neo4j thật; cần chạy worker sau khi các service và migration lifecycle đã sẵn sàng.
+
+## Chuẩn hóa pipeline chatbot tư vấn nhóm môn — 2026-10-18
+
+- [x] Thêm intent router có giới hạn và kiểm chứng evidence: bộ lọc/năm học phải xuất hiện trong lời người dùng; môn học phải khớp phần evidence; điểm không có thang được hỏi lại.
+- [x] Tách route chào hỏi, kiến thức, danh mục tổ hợp, danh sách nhóm môn, đối chiếu nhóm môn và truy vấn ngành; nhóm được trình bày theo từng tiêu chí, không có điểm phần trăm hay thứ hạng tổng hợp.
+- [x] Khi LLM/Neo4j/Backend lỗi, trả trạng thái lỗi phù hợp; bỏ heuristic/mock fallback. RAG trả context đã truy xuất và tối đa 20 evidence có trạng thái truncation chính xác.
+- [x] Giữ router và generator dùng `settings.LLM_MODEL` từ `.env`; test xác nhận giá trị `ag/claude-sonnet-4-6(high)` được chuyển nguyên vẹn tới request provider.
+- [x] Kiểm tra: `python -m unittest discover -s tests -v` (100 test đạt); `compileall -q rag_api tests`; không gọi LLM/DB thật.
+- [ ] Chưa chạy smoke test qua 9Router, Spring API và Neo4j đang hoạt động; `output/evaluation_results.csv` lịch sử được giữ nguyên.
+
+
+
+## Narrow retrieval evidence and chatbot routes - 2026-10-19
+
+- [x] Add `response_mode` and ordered `retrieval_units` with provenance while preserving existing response fields.
+- [x] Filter group lookup by explicitly requested codes and narrow subject-catalog evidence to the requested subject/category.
+- [x] When no high school is named, acknowledge the user's stated signals and ask for one next detail before comparing actual groups.
+- [x] Add unit tests for evidence, group filtering, subject lookup, evidence-verified group codes, and advice without a selected school.
+- [x] Verification: `python -m unittest discover -s tests -q` - 105 tests passed; focused `py_compile` passed; `git diff --check` passed.
+- [ ] No live smoke test through `rag-api`, Backend, Neo4j, or 9Router. Rebuild `rag-api` before testing in the UI.
+
+
+## Evaluation framework diagnostic implementation - 2026-10-19
+
+- Added a deterministic subject-set route for admission-combination lookup, with exact/alias subject resolution, ambiguity clarification, all-candidate output, and non-assertive no-result wording. Parser codes require matching evidence in the current or prior user message; assistant-only and unsupported inferred codes are ignored, and current-turn codes override stale parser filters.
+- Added 20 offline Parser/Router diagnostic fixtures and a history pass-through test. The history test uses a mocked parser result; live LLM behavior remains unverified. Aptitude-only phrasing remains an identified limitation in PR13.
+- Verification: full `python -m unittest discover -s tests -v` passed (111 tests). No LLM/API, PostgreSQL, Neo4j, or evaluation calls were made.
+- The historical pre-H3 candidate `main_api.py` source hash was checked against its snapshot manifest before the source change. Existing user modifications and untracked files were preserved.
+
+
+## Evaluation Framework Revision 3 - Parser/Router diagnostic verification - 2026-10-19
+
+- [x] Ran all 20 deterministic diagnostic fixtures through the chatbot endpoint with mocked parser/backend dependencies: 15 combination lookup cases and five admission lookup/readiness/retrieval cases. Parser JSON normalization, `is_ready_for_db`, route filters, response modes and expected outcomes are asserted.
+- [x] H3 was identified from the historical pre-H3 candidate and is already fixed in current V0; this does not establish an H3 quality effect. H4 readiness is not the direct cause for the `combination_lookup` route because that branch returns before the general readiness guard.
+- [x] Full offline suite: `python -m unittest discover -s tests -q` - 112 tests passed.
+- [ ] H1/H2 with real model outputs, H5 against live/source catalog coverage, H6 with reviewed labels, and aptitude-only PR13 behavior remain unverified. Fixtures use mocks; no LLM/API, PostgreSQL, Neo4j, dataset generation or evaluation run was performed.
+
+## R0 current V0 baseline update - 2026-10-19
+
+The current V0 artifact is doc/rag-baselines/current-v0-20261019.zip (301 verified files; SHA-256 bc7852352202eb076ecf56e685a4a39181e639f2e0cd716d31c68bf63539cf29), with manifest doc/rag-baselines/current-v0-20261019.manifest.json (SHA-256 f4442f710031988ad515f332325ec626a8d8b11d80318114b25c477731db6ada). Clean-temp restore, py_compile, and 112 offline Data Scrawler tests passed. The manifest records safe model/runtime settings, local dependency inventory, prompt hashes, repository dirty paths, and source-data hashes; it excludes .env values. Docker/live DB/Neo4j/LLM replay was not run. Route telemetry was added after the V0 snapshot and passed 23 routing tests, seven diagnostics, compilation, and the evaluator route-contract smoke. No H3 quality gain is claimed.
+
+## RAG Pipeline R1a-R3c implementation update - 2026-10-20
+
+- R1a/R1b/R1c: centralized parser-to-retriever filters; kept high-school academic year separate from admission year and method; rejected numeric fields that do not match user evidence; current-turn corrections clear stale selectors while explicit follow-ups may reuse the latest user-provided selector.
+- R2a/R2b/R2c: objective subject-group comparison works without a personal profile; comparison accepts admission-year and method scope; exact subject-set resolution uses the additive Backend route `POST /api/v1/admissions/combinations/resolve-by-subjects`; the existing `search-by-subjects` capability-matching contract is unchanged; known groups/labels can be returned with an explicit partial marker.
+- R3a/R3b/R3c: graph context preserves aptitude requirements, admission year, method codes and source URLs; explicit school-year filtering is applied; evidence IDs and relationship-path identifiers are stable across unordered list changes; chat responses expose context evidence IDs and omitted IDs when context is truncated.
+- Verification: `python -m unittest discover -s tests -q` passed (128 tests); `python -m compileall -q rag_api` passed. Backend full Maven test suite passed (161 tests, 0 failures, 13 skipped). No LLM, PostgreSQL, Neo4j or benchmark calls were made; quality improvement is not claimed.
+- Remaining validation: live API contract smoke and paired V0/V1 quality evaluation remain pending the Revision 3 gates and a frozen benchmark.
+## 2026-10-20 — V1 integration contract fixes
+
+- Exact combination resolver responses are validated at the Backend adapter boundary. Malformed HTTP 200 bodies, including `matches: null`, return controlled HTTP 502; a valid empty list remains `no_data`.
+- Successful Graph answers expose an explicit SHA-256 attestation of the exact `graph_context` argument. The existing `retrieved_context` carries the text, without a duplicate context field. No answer-generation or retrieval algorithm change was made.
+- Targeted tests were run fail-before/pass-after; full Data Scrawler regression status and the new candidate artifact are recorded in `../../doc/rag-v1-contract-fix-report.md`. U2 remains unchanged for R4.
+
+## RAG Pipeline R4-R6 implementation update - 2026-10-20
+
+- R4: Neo4j retrieval now limits unique program candidates before expanding accepted combinations, subjects, aptitude requirements, and cutoffs. The prior read-only U2 reproduction returned 1/3/7/12 unique programs at `top_k` 3/10/30/54; the corrected read-only check returned 3/10/30/54. After one warm-up, five read-only queries per setting had median latency 8.20/15.55/38.20/65.70 ms (ranges 7.83–10.24/12.73–15.62/35.29–40.65/56.31–92.65 ms). This is a local Neo4j retrieval diagnostic, not a paired quality claim.
+- R5: Graph records now include a deterministic dependency validation for program, scoped combination acceptance, subject/aptitude, and requested school-group path edges. Missing edge endpoints or requested year/method/school scope are surfaced separately and make the answer completeness `partial`. Aptitude requirements remain explicitly unverified as satisfied by a school group.
+- R6: Combination lookup now consumes the same normalized history as parsing and routing, including the legacy `chat_history` request field. Tests ensure assistant-only suggestions do not become user-confirmed selectors. Existing status-based response modes and partial-answer behavior are preserved; no prompt/model changes were made.
+- Verification: Data Scrawler full suite passed (136 tests), including the final scope assertions; the restored candidate also passed all 136 tests. Targeted Backend combination resolver/comparison tests passed (12 tests). No RAGAS, benchmark generation, paid LLM call, or database write was performed. Final candidate: `doc/rag-baselines/v2-r4-r6-20261020.zip`, SHA-256 `600b3e05f631fe09e4208843768da9153ef3221fa3cf3ed70a4444babf8cf1e5`. Existing V0/V1 archives remain unchanged; the candidate manifest is adjacent to the archive.
+
+### Latest source candidate and Docker contract check - 2026-10-20
+
+- Re-froze the current R0-R6 implementation after fixing the Backend native PostgreSQL timestamp projection used by exact combination resolution. The previous V0, V1, and V2 archives were preserved.
+- Candidate: `doc/rag-baselines/v2-r4-r6-backend-timestamp-fix-20261020.zip`, SHA-256 `991e356ffcfd1deb7fc5bfffb235602c325b82a4c107372a9cbdbd96b2aba82e`; manifest SHA-256 `79d8b9a66e409c55fb52c342c30fee28b8e039edbbcdec2923f970747b8541a2`. Archive integrity and all 304 restored file hashes passed; restored Python syntax and offline Data Scrawler suite passed.
+- Current offline verification: Data Scrawler 136 tests passed; RAG evaluation 60 tests passed; Backend 162 tests passed, 0 failures/errors, 13 database-dependent skips.
+- Docker read-only checks: `rag-api /health` reported healthy with Neo4j connected; `GET /api/v1/admissions/combinations/A00` and `POST /api/v1/admissions/combinations/resolve-by-subjects` returned success. No `/api/chat` generation, paid LLM call, RAGAS evaluation, benchmark generation, or database write was performed. R7 quality comparison remains blocked on reviewed G5 benchmark and G6 paired-run prerequisites.

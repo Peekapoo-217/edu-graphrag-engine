@@ -1,0 +1,5 @@
+# Offline unit-test dependencies for the Data Scrawler test suite.
+-r requirements-rag.txt
+
+# Required by the installed Starlette TestClient used in API contract tests.
+httpx2>=0.1.0

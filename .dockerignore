@@ -1,6 +1,7 @@
 data/
 qnu_data/
 upload/
+output/
 .git
 .gitignore
 .env

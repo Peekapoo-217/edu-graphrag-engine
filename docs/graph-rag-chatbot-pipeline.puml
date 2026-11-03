@@ -1,0 +1,68 @@
+@startuml graph_rag_high_level
+title GraphRAG chatbot - sơ đồ tổng quan
+
+left to right direction
+skinparam componentStyle rectangle
+skinparam shadowing false
+skinparam packageStyle rectangle
+
+actor "Học sinh / phụ huynh" as User
+rectangle "Giao diện chat\nAngular" as UI
+rectangle "GraphRAG API\nFastAPI" as RAG
+rectangle "Spring Boot API\nđề xuất nhóm môn THPT" as Spring
+cloud "9Router\nphân tích intent / tạo câu trả lời" as LLM
+cloud "Ollama\nbge-m3 embeddings" as Embedder
+database "PostgreSQL\nnguồn dữ liệu chuẩn" as PG
+database "Neo4j\nđồ thị + vector ngành" as Neo4j
+
+package "Chuẩn bị dữ liệu (tác vụ riêng)" {
+  rectangle "Đồng bộ dữ liệu đã chuẩn hóa" as Projection
+  rectangle "Tạo embedding cho ngành" as EmbedJob
+}
+
+package "Chat trực tuyến" {
+  rectangle "Nhánh tư vấn nhóm môn\n(intent subject-group)" as GroupBranch
+  rectangle "Nhánh hỏi đáp tuyển sinh\n(intent thông thường)" as AdmissionBranch
+}
+
+PG --> Projection : dữ liệu đã duyệt / chuẩn hóa
+Projection --> Neo4j : tạo hoặc cập nhật graph
+Neo4j --> EmbedJob : ngành chưa có vector
+EmbedJob --> Embedder : tạo vector mô tả ngành
+Embedder --> EmbedJob : vector
+EmbedJob --> Neo4j : lưu embedding
+
+User --> UI : gửi câu hỏi
+UI --> RAG : câu hỏi + lịch sử chat
+RAG --> LLM : nhận diện intent
+LLM --> RAG : intent và bộ lọc
+
+RAG --> GroupBranch : yêu cầu nhóm môn
+GroupBranch --> Spring : xác thực trường / môn / năm
+Spring --> PG : đọc danh mục chuẩn
+Spring --> Neo4j : lấy nhóm đã công bố và xếp hạng
+Spring --> RAG : nhóm môn phù hợp
+RAG --> UI : đề xuất nhóm môn
+
+RAG --> AdmissionBranch : hỏi đáp tuyển sinh
+AdmissionBranch --> Embedder : tạo vector câu hỏi
+Embedder --> AdmissionBranch : vector câu hỏi
+AdmissionBranch --> Neo4j : tìm ngành và quan hệ liên quan
+Neo4j --> AdmissionBranch : kết quả và ngữ cảnh graph
+AdmissionBranch --> LLM : tạo câu trả lời dựa trên ngữ cảnh
+LLM --> AdmissionBranch : câu trả lời
+AdmissionBranch --> RAG : kết quả trả lời
+RAG --> UI : câu trả lời
+
+RAG --> UI : hỏi bổ sung nếu thiếu thông tin
+
+note bottom of Projection
+  Đồng bộ graph và tạo embedding chạy riêng;
+  chúng không chạy lại theo từng câu hỏi chat.
+end note
+
+note bottom of Neo4j
+  PostgreSQL giữ dữ liệu có cấu trúc chuẩn.
+  Neo4j là projection phục vụ truy vấn quan hệ và tìm kiếm vector.
+end note
+@enduml

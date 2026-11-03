@@ -17,6 +17,7 @@ RUN pip install --no-cache-dir --upgrade pip && \
     pip install --no-cache-dir -r requirements-rag.txt
 
 # Copy RAG API application source code
+COPY config ./config
 COPY rag_api ./rag_api
 
 # Create non-root user for security compliance

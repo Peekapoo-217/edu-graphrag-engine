@@ -9,8 +9,11 @@ Fully compliant with system architecture and coding guidelines.
 """
 
 import json
+import hashlib
 import os
+import re
 import sys
+import time
 from typing import Any, Dict, List, Optional
 import requests
 
@@ -21,15 +24,24 @@ if BASE_DIR not in sys.path:
 
 from rag_api.utils.config import settings
 from rag_api.utils.logger import logger
+from rag_api.llm.provider_errors import LLMServiceUnavailable
+from rag_api.utils.provider_attempt_budget import provider_run_headers, record_provider_attempt
+from rag_api.utils.diagnostic_stage_trace import DiagnosticStageTrace
 
-RAG_SYSTEM_PROMPT = """Bạn là một Chuyên gia Kỹ sư Tư vấn Tuyển sinh Đại học AI am hiểu sâu sắc về thông tin tuyển sinh, ngành học và điểm chuẩn tại Việt Nam.
+RAG_SYSTEM_PROMPT = """Bạn là trợ lý giúp học sinh lớp 9 tìm hiểu nhóm môn THPT và các hướng ngành có dữ liệu liên kết.
 
-Nhiệm vụ của bạn:
-1. Trả lời câu hỏi của người dùng một cách chính xác, rõ ràng, lịch sự và chân thành.
-2. NGUYÊN TẮC TỐI THƯỢNG: Bạn TUYỆT ĐỐI CHỈ ĐƯỢC trả lời dựa vào thông tin có trong [NGỮ CẢNH DỮ LIỆU ĐỒ THỊ TRI THỨC] được cung cấp bên dưới.
-3. Nếu [NGỮ CẢNH DỮ LIỆU ĐỒ THỊ TRI THỨC] bị trống hoặc KHÔNG có thông tin giải đáp câu hỏi của người dùng, bạn BẮT BUỘC phải thành thật xin lỗi và thông báo rằng hệ thống chưa có dữ liệu cho câu hỏi này. Tuyệt đối KHÔNG tự bịa đặt, suy đoán hoặc bịa ra điểm số/ngành học/tổ hợp môn (No Hallucination).
+Quy tắc trả lời:
+1. Trả lời thẳng câu hỏi bằng tiếng Việt, phù hợp với học sinh và phụ huynh.
+2. Chỉ khẳng định dữ kiện có trong ngữ cảnh bằng chứng phía dưới. Không tự tạo trường, nhóm, mã môn,
+   tổ hợp, offer, năm tuyển sinh hoặc điểm chuẩn.
+3. Phân biệt môn yêu thích, điểm học tập, tự nhận xét năng lực và mức tự tin. Điểm số do học sinh cung cấp
+   là thông tin tự khai, không phải điểm chuẩn hay căn cứ kết luận trúng tuyển.
+4. Nhóm môn THPT và tổ hợp xét tuyển là hai dữ liệu khác nhau. Chỉ nêu hướng ngành khi ngữ cảnh có offer
+   nối tổ hợp với trường/ngành. Yêu cầu năng khiếu phải được nêu riêng.
+5. Ghi rõ năm học THPT và năm tuyển sinh theo đúng trường dữ liệu. Lịch sử tuyển sinh không bảo đảm kết quả tương lai.
+6. Nếu thiếu bằng chứng, nói rõ phần nào chưa có dữ liệu và hỏi tối đa một thông tin giúp tiếp tục.
 
-[NGỮ CẢNH DỮ LIỆU ĐỒ THỊ TRI THỨC]:
+[NGỮ CẢNH BẰNG CHỨNG ĐÃ TRUY XUẤT]:
 {context}
 """
 
@@ -55,7 +67,8 @@ class RAGGenerator:
         user_query: str,
         graph_context: str,
         context: Optional[List[Dict[str, str]]] = None,
-        chat_history: Optional[List[Dict[str, str]]] = None
+        chat_history: Optional[List[Dict[str, str]]] = None,
+        request_id: Optional[str] = None,
     ) -> str:
         """
         Generate grounded answer using 9router API Gateway based on query and graph context.
@@ -72,10 +85,8 @@ class RAGGenerator:
         if not user_query or not user_query.strip():
             return "Câu hỏi người dùng không được để trống."
 
-        # Fallback if no valid API key is set
         if not self.api_key or self.api_key.startswith("your_"):
-            logger.warning("No valid LLM_API_KEY set for 9router. Running in Fallback Response mode.")
-            return self._mock_fallback_answer(user_query, graph_context)
+            raise LLMServiceUnavailable("LLM provider is not configured")
 
         history: List[Dict[str, str]] = context or chat_history or []
         system_content = RAG_SYSTEM_PROMPT.format(
@@ -106,22 +117,57 @@ class RAGGenerator:
             "stream": False
         }
 
+        started = time.perf_counter()
         try:
-            response = requests.post(endpoint, headers=headers, json=payload, timeout=self.timeout)
-            response.raise_for_status()
+            trace = DiagnosticStageTrace.current()
+            if trace is not None and trace.enabled:
+                exact_context = graph_context.strip() if graph_context and graph_context.strip() else ""
+                prompt_text = "".join(message["content"] for message in messages)
+                trace.generation_input(
+                    context_chars=len(exact_context),
+                    context_utf8_bytes=len(exact_context.encode("utf-8")),
+                    context_sha256=hashlib.sha256(exact_context.encode("utf-8")).hexdigest(),
+                    prompt_chars=len(prompt_text),
+                    prompt_utf8_bytes=len(prompt_text.encode("utf-8")),
+                    message_count=len(messages),
+                    history_turn_count=len(messages) - 2,
+                    provider_timeout_seconds=self.timeout,
+                )
+            headers.update(provider_run_headers(endpoint=endpoint, stage="generation", request_id=request_id or ""))
+            record_provider_attempt(stage="generation", request_id=request_id, endpoint=endpoint,
+                                    request_headers=headers)
+            response = requests.post(endpoint, headers=headers, json=payload, timeout=self.timeout,
+                                     allow_redirects=False)
+            status_code = _safe_status_code(response) or 200
+            if isinstance(status_code, int) and not 200 <= status_code < 300:
+                response.raise_for_status()
+                raise requests.HTTPError(response=response)
+            logger.info("provider_call request_id=%s stage=generation attempt=1 outcome=response http_status=%d duration_ms=%.1f",
+                        _safe_request_id(request_id), status_code,
+                        (time.perf_counter() - started) * 1000)
             answer_text = self._extract_text_from_response(response)
+            if not answer_text or not answer_text.strip():
+                raise LLMServiceUnavailable("LLM provider returned an empty response")
             return answer_text.strip()
 
         except requests.exceptions.Timeout:
-            logger.error(f"9router API request timed out after {self.timeout} seconds.")
-            return "Xin lỗi bạn, kết nối đến mô hình AI tạm thời bị quá thời gian chờ (Timeout). Vui lòng thử lại sau."
+            logger.info("provider_call request_id=%s stage=generation attempt=1 outcome=timeout http_status=none duration_ms=%.1f",
+                        _safe_request_id(request_id), (time.perf_counter() - started) * 1000)
+            logger.warning("9router timed out during answer generation")
+            raise LLMServiceUnavailable("LLM provider timed out", failure_code="timeout")
         except requests.exceptions.RequestException as e:
-            logger.error(f"9router API HTTP Request Error in RAGGenerator: {e}")
-            return self._mock_fallback_answer(user_query, graph_context)
-        except (KeyError, IndexError, TypeError) as e:
-            logger.error(f"Unexpected JSON structure response from 9router: {e}")
-            return "Xin lỗi bạn, phản hồi từ mô hình AI bị lỗi định dạng."
-
+            status_code = _safe_status_code(getattr(e, "response", None)) or _safe_status_code(
+                locals().get("response"))
+            logger.info("provider_call request_id=%s stage=generation attempt=1 outcome=provider_error http_status=%s duration_ms=%.1f",
+                        _safe_request_id(request_id), status_code or "none",
+                        (time.perf_counter() - started) * 1000)
+            logger.warning("9router request failed during answer generation: %s", type(e).__name__)
+            raise LLMServiceUnavailable("LLM provider request failed", upstream_status_code=status_code) from e
+        except LLMServiceUnavailable:
+            raise
+        except (KeyError, IndexError, TypeError, ValueError) as e:
+            logger.warning("9router returned an unusable answer response: %s", type(e).__name__)
+            raise LLMServiceUnavailable("LLM provider returned an unusable response") from e
     def _extract_text_from_response(self, response: requests.Response) -> str:
         """Robustly extract text response from either standard JSON or SSE stream response."""
         content_type = response.headers.get("content-type", "")
@@ -162,19 +208,14 @@ class RAGGenerator:
         res_data = response.json()
         return res_data["choices"][0]["message"]["content"]
 
-    def _mock_fallback_answer(self, user_query: str, graph_context: str) -> str:
-        """Safe fallback generator when 9router API endpoint is unavailable."""
-        if not graph_context or "Không tìm thấy" in graph_context:
-            return (
-                "Xin lỗi bạn, hiện tại hệ thống chưa có dữ liệu về thông tin tuyển sinh này "
-                "để tư vấn cho bạn. Vui lòng tra cứu thêm tại trang thông tin tuyển sinh chính thức của trường."
-            )
-        return (
-            f"Dựa trên dữ liệu Đồ thị tri thức tuyển sinh:\n\n{graph_context}\n\n"
-            f"Trả lời cho câu hỏi '{user_query}': Dữ liệu ngành học và điểm chuẩn đã được trích xuất ở trên. "
-            f"Vui lòng đối chiếu điểm số của bạn với lịch sử điểm chuẩn để có lựa chọn phù hợp nhất."
-        )
 
+def _safe_status_code(response: Any) -> int | None:
+    status = getattr(response, "status_code", None)
+    return status if isinstance(status, int) and not isinstance(status, bool) and 100 <= status <= 599 else None
+
+
+def _safe_request_id(value: Optional[str]) -> str:
+    return value if isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9._-]{1,128}", value) else "none"
 
 if __name__ == "__main__":
     if hasattr(sys.stdout, "reconfigure"):

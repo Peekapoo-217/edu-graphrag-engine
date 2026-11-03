@@ -1,0 +1,176 @@
+[
+  {
+    "case_id": "PR01",
+    "kind": "code",
+    "question": "Tra cứu tổ hợp A01 gồm môn gì?",
+    "filters": {
+      "combination_code": "A01"
+    },
+    "expected_status": "success",
+    "expected_stage": "code_lookup"
+  },
+  {
+    "case_id": "PR02",
+    "kind": "code_from_text",
+    "question": "Tổ hợp A01 có những môn nào?",
+    "filters": {},
+    "expected_status": "success",
+    "expected_stage": "explicit_code_resolution"
+  },
+  {
+    "case_id": "PR03",
+    "kind": "code",
+    "question": "Cho em xem mã tổ hợp k01",
+    "filters": {
+      "combination_code": "K01"
+    },
+    "expected_status": "success",
+    "expected_stage": "code_lookup"
+  },
+  {
+    "case_id": "PR04",
+    "kind": "code_not_found",
+    "question": "Tổ hợp A99 gồm môn gì?",
+    "filters": {
+      "combination_code": "A99"
+    },
+    "expected_status": "no_data",
+    "expected_stage": "code_lookup"
+  },
+  {
+    "case_id": "PR05",
+    "kind": "multiple_variants",
+    "question": "Cho em xem các biến thể của tổ hợp K01",
+    "filters": {
+      "combination_code": "K01"
+    },
+    "expected_status": "success",
+    "expected_stage": "preserve_all_variants"
+  },
+  {
+    "case_id": "PR06",
+    "kind": "subject_set",
+    "question": "Tổ hợp Toán, Vật lí và Tiếng Anh có mã nào?",
+    "filters": {},
+    "expected_status": "success",
+    "expected_stage": "backend_exact_subject_resolver"
+  },
+  {
+    "case_id": "PR07",
+    "kind": "subject_set",
+    "question": "Tìm tổ hợp có Toán và Vật lí",
+    "filters": {},
+    "expected_status": "success",
+    "expected_stage": "backend_exact_subject_resolver"
+  },
+  {
+    "case_id": "PR08",
+    "kind": "one_subject",
+    "question": "Tìm tổ hợp có môn Toán",
+    "filters": {},
+    "expected_status": "incomplete",
+    "expected_stage": "subject_count_validation"
+  },
+  {
+    "case_id": "PR09",
+    "kind": "five_subjects",
+    "question": "Tổ hợp Toán, Vật lí, Hóa học, Sinh học và Tin học",
+    "filters": {},
+    "expected_status": "incomplete",
+    "expected_stage": "subject_count_validation"
+  },
+  {
+    "case_id": "PR10",
+    "kind": "ambiguous_subject",
+    "question": "Tổ hợp có môn Lịch sử",
+    "filters": {},
+    "expected_status": "incomplete",
+    "expected_stage": "catalog_resolution"
+  },
+  {
+    "case_id": "PR11",
+    "kind": "no_identifier",
+    "question": "Tổ hợp xét tuyển gồm những môn nào?",
+    "filters": {},
+    "expected_status": "incomplete",
+    "expected_stage": "intent_or_handler_clarification"
+  },
+  {
+    "case_id": "PR12",
+    "kind": "name_without_components",
+    "question": "Tìm tổ hợp có tên năng khiếu mỹ thuật",
+    "filters": {},
+    "expected_status": "incomplete",
+    "expected_stage": "intent_or_handler_clarification"
+  },
+  {
+    "case_id": "PR13",
+    "kind": "aptitude_not_in_catalog",
+    "question": "Tổ hợp có môn năng khiếu và Toán",
+    "filters": {},
+    "expected_status": "incomplete",
+    "expected_stage": "subject_count_validation",
+    "diagnostic_note": "Aptitude intent cannot be resolved from the regular-subject catalog; it currently falls through to subject-count clarification."
+  },
+  {
+    "case_id": "PR14",
+    "kind": "subject_alias",
+    "question": "Tìm tổ hợp có Toán và Văn",
+    "filters": {},
+    "expected_status": "success",
+    "expected_stage": "backend_exact_subject_resolver"
+  },
+  {
+    "case_id": "PR15",
+    "kind": "no_substring_false_positive",
+    "question": "Ngành học nào có lộ trình tốt?",
+    "filters": {},
+    "expected_status": "incomplete",
+    "expected_stage": "subject_catalog_match"
+  },
+  {
+    "case_id": "PR16",
+    "kind": "admission_program_lookup",
+    "question": "Đại học Quy Nhơn xét tuyển ngành Kỹ thuật phần mềm bằng tổ hợp nào?",
+    "intent": "pathway_lookup",
+    "filters": {"university": "Đại học Quy Nhơn", "desired_program": "Kỹ thuật phần mềm"},
+    "expected_status": "success",
+    "expected_stage": "graph_retrieval_generation"
+  },
+  {
+    "case_id": "PR17",
+    "kind": "admission_missing_filters",
+    "question": "Thông tin tuyển sinh của các trường đại học thế nào?",
+    "intent": "pathway_lookup",
+    "filters": {"university": null, "desired_program": null, "keyword": null},
+    "expected_status": "incomplete",
+    "expected_stage": "readiness_guard"
+  },
+  {
+    "case_id": "PR18",
+    "kind": "admission_cutoff_lookup",
+    "question": "Điểm chuẩn ngành Công nghệ thông tin Đại học Quy Nhơn năm 2025 là bao nhiêu?",
+    "intent": "pathway_lookup",
+    "filters": {"university": "Đại học Quy Nhơn", "desired_program": "Công nghệ thông tin", "admission_year": "2025"},
+    "expected_status": "success",
+    "expected_stage": "graph_retrieval_generation"
+  },
+  {
+    "case_id": "PR19",
+    "kind": "admission_unknown_year",
+    "question": "Đại học Quy Nhơn có offer ngành Công nghệ thông tin năm 2025 không?",
+    "intent": "pathway_lookup",
+    "filters": {"university": "Đại học Quy Nhơn", "desired_program": "Công nghệ thông tin", "admission_year": "2025"},
+    "expected_status": "no_data",
+    "expected_stage": "graph_retrieval_empty"
+  },
+  {
+    "case_id": "PR20",
+    "kind": "admission_retrieval_failure",
+    "question": "Đại học Quy Nhơn xét tuyển ngành Kỹ thuật phần mềm như thế nào?",
+    "intent": "pathway_lookup",
+    "filters": {"university": "Đại học Quy Nhơn", "desired_program": "Kỹ thuật phần mềm"},
+    "expected_status": "service_error",
+    "expected_stage": "graph_retrieval_error"
+  }
+]

@@ -1,6 +1,8 @@
 # Module `rag_api/` - Hybrid GraphRAG Admissions Advisor API
 
-> Lưu ý cho hướng tư vấn học sinh lớp 9: ngoài hội thoại RAG hiện hữu, `/api/chat` có nhánh `subject_group_recommendation`. Nhánh này xác thực nhãn trường/môn với catalog của Spring API rồi ủy quyền xếp hạng cho `POST /api/v1/high-schools/{schoolCode}/subject-groups/recommendations`; LLM không tự tính điểm. Cấu hình kết nối bằng `SUBJECT_PATHWAY_API_URL` và `SUBJECT_PATHWAY_API_TIMEOUT`. Xem công thức và ví dụ request tại [`doc/subject-group-recommendations.md`](../../doc/subject-group-recommendations.md).
+Sơ đồ PlantUML mức tổng quan về luồng chuẩn bị dữ liệu và xử lý chat: [`graph-rag-chatbot-pipeline.puml`](graph-rag-chatbot-pipeline.puml).
+
+> Luồng `subject_group_recommendation` và endpoint `/recommendations` là hợp đồng cũ còn được giữ để tương thích. Chat hiện tại dùng intent `subject_group_comparison`, đối chiếu từng tiêu chí và không xếp hạng tổng hợp; xem mục 12. Tài liệu request cũ vẫn có tại [`doc/subject-group-recommendations.md`](../../doc/subject-group-recommendations.md).
 
 ## 1. Mục đích
 
@@ -70,9 +72,9 @@ class ChatRequest(BaseModel):
 
 ```python
 class ChatResponse(BaseModel):
-    status: str    # "ready", "incomplete", hoặc "success"
+    status: str    # "success", "incomplete", "no_data", hoặc "unsupported"
     message: str   # Nội dung phản hồi
-    data: Optional[Dict]  # Dữ liệu chi tiết (filters, records_count, context_summary)
+    data: Optional[Dict]  # Dữ liệu chi tiết (filters, retrieved_context, evidence)
 ```
 
 ### 3.4 API Endpoints
@@ -90,14 +92,14 @@ Step 2: Check Completeness
     └── status == "ready" → Extract filters, tiếp tục
 
 Step 3: Retrieve Context from Neo4j
-    ├── retriever.retrieve_context(filters, top_k=3) → records
+    ├── retriever.retrieve_context(filters, top_k=21) → tối đa 20 records trong response
     └── retriever.format_for_llm(records) → formatted_context (Markdown)
 
 Step 4: Generate LLM Answer
     └── generator.generate_answer(user_query, graph_context, context) → answer_text
 
 Step 5: Return ChatResponse
-    └── {status: "success", message: answer_text, data: {filters, retrieved_count, context_summary}}
+    └── {status: "success", message: answer_text, data: {filters, retrieved_count, retrieved_context, evidence, evidence_truncated}}
 ```
 
 #### `GET /health`
@@ -264,9 +266,9 @@ Output JSON:
 
 Kiểm tra `status == "ready"` và至少 1 filter chính (`keyword`, `university`, hoặc `high_school`) có giá trị.
 
-### 6.4 Fallback Heuristic
+### 6.4 Provider error handling
 
-Khi không có LLM API key hợp lệ, sử dụng rule-based parser với predefined keywords/universities/high_schools.
+The historical heuristic parser fallback has been removed. A missing key, provider error, invalid JSON, or unusable response produces an HTTP 503 response; the service does not fabricate a successful parse.
 
 ## 7. `llm/llm_client.py` - RAG Generator
 
@@ -288,9 +290,22 @@ Nếu không có dữ liệu → Xin lỗi và thông báo.
 TUYỆT ĐỐI KHÔNG tự bịa đặt (No Hallucination).
 ```
 
-### 7.3 Fallback
+### 7.3 Provider error handling
 
-Khi không có LLM API key hợp lệ, trả về mock response chứa graph context trực tiếp.
+The historical mock answer fallback has been removed. A missing key, provider error, or empty/unusable response produces an HTTP 503 response. The chat UI can then show a retry message without exposing deployment commands.
+
+Parser, retrieval, and generation HTTP errors include additive `X-Request-ID`, `X-Error-Stage`,
+`X-Error-Type`, and `X-Error-Code` response headers. The stage is `intent`, `retrieval`, or
+`generation`; the code is a sanitized `timeout`, `connect_timeout`, `read_timeout`,
+`provider_failure`, or `error`. Intent connection timeouts mean the connection was not
+established; read timeouts mean no response data arrived within the configured Requests read
+timeout. A read timeout does not identify whether the provider or an intermediary caused the
+delay. These headers
+contain no provider message, prompt, credentials, or conversation history.
+When a provider returns an HTTP 4xx/5xx response, the Chatbot also returns a numeric
+`X-Upstream-Status` header (for example `429`). This is the upstream status only; provider body
+text and credentials are not forwarded. Each parser/generation stage sends one completion POST,
+does not retry client-side, and disables redirects.
 
 ## 8. Chạy API Server
 
@@ -320,7 +335,9 @@ curl -X POST http://localhost:8000/api/chat \
   "data": {
     "filters": {"keyword": "cntt", "university": "quy nhơn", ...},
     "retrieved_count": 3,
-    "context_summary": "### NGỮ CẢNH DỮ LIỆU..."
+    "retrieved_context": "### NGỮ CẢNH DỮ LIỆU...",
+    "evidence": [{"program_name": "...", "combination_name": "..."}],
+    "evidence_truncated": false
   }
 }
 ```
@@ -334,3 +351,78 @@ curl -X POST http://localhost:8000/api/chat \
 ## 11. Environment-only model configuration
 
 The RAG API and PDF extraction worker read `LLM_API_KEY`, `LLM_API_BASE`, and `LLM_MODEL` from their environment. Intent classification, chat answer generation, and document extraction remain distinct requests/flows, while using the configured model and provider. There is no internal endpoint for retrieving or overriding model configuration, and the backend admin UI cannot read or change these values. Keep the key in the local `.env` file and out of source control.
+
+## 12. Current chat contract — 2026-10-18
+
+This section is the current contract and supersedes the earlier five-step example above.
+
+- `POST /api/chat` accepts `user_message` and up to 40 prior turns in `context`. The current message is sent separately and is not duplicated in history. `chat_history` remains a compatibility alias.
+- The router selects a bounded intent: greeting, unsupported, knowledge, school group lookup, combination lookup, pathway lookup, subject-group advice, or subject-group comparison. Only explicit user evidence may become a preference, strength, confidence value, or grade. An assessment scale is accepted only when the user states it.
+- Subject-group comparison resolves school and subject names against the Backend catalog. Ambiguous or unknown labels are returned for clarification. It sends the profile to `POST /api/v1/high-schools/{schoolCode}/subject-groups/comparisons`; the Backend returns criterion-by-criterion matches and real admission offers. It does not calculate a percentage or aggregate ranking.
+- The comparison response keeps the legacy `subjects` field as the effective set (group subjects plus mandatory subjects) and adds `groupSubjects` and `mandatorySubjects` so the chat formatter can state group membership without conflating the two. Group-composition replies use `groupSubjects`; mandatory/common subjects are shown separately when present. Matching admission combinations are only listed when the user asks about combinations/pathways or a verified requested-program offer exists.
+- Combination lookup by public code uses `GET /api/v1/admissions/combinations/{code}`; exact 2-4 subject sets use `POST /api/v1/admissions/combinations/resolve-by-subjects`. The existing `search-by-subjects` capability-search semantics are unchanged. A school lookup uses the Backend's high-school and subject-group endpoints.
+- Current response statuses are `success`, `incomplete`, `no_data`, and `unsupported`. General RAG responses return `data.retrieved_context`, structured `data.evidence` (at most 20 records), `data.retrieved_count`, `data.context_evidence_ids`, `data.omitted_evidence_ids`, and `data.evidence_truncated`. Empty retrieval is `no_data`; Neo4j, Backend, or LLM unavailability returns HTTP 503.
+- Both router and answer generation read `settings.LLM_MODEL` from `data-scrawler/.env`; the configured value remains `ag/claude-sonnet-4-6(high)`. No provider/model fallback or mock answer is returned on failure.
+
+
+## 13. Relevance evaluation response contract - 2026-10-19
+
+- `data.response_mode` is additive and uses `answer`, `clarification`, `abstention`, or `unsupported`. Existing API status and fields remain compatible.
+- `data.retrieval_units` contains ordered evidence with `id`, `source`, `record_type`, and `text`. The evaluator uses these units; `data.retrieved_context` remains available to older clients.
+- `data.actual_execution_route` separates `intent_handler`/`handler` from the retrieval route. It includes `retrieval_executed` (`true`, `false`, or `null`), `retrieval_status` (`executed`, `not_executed`, or `unknown`), `retrieval_route`, and the observed `evidence_source`. It also retains `execution_kind`, `graph_retrieval_executed`, `generation_executed`, request/trace reference, and available evidence entity/relationship IDs. `response_disposition` mirrors `data.response_mode`; `disposition_reason` is populated only when a handler provides a clarification, abstention, or unsupported reason. When route evidence is insufficient, `execution_kind` stays `unknown` and `unknown_route_reason` identifies the missing evidence; it is never inferred from answer text. This field is additive and contains no question text or credentials.
+- A two-school comparison keeps the school/group pair stated in the current user message. A group may be written as a numbered label (for example, “Nhóm 02”) or a public code (“G02”); aliases are paired only inside a clause that identifies one school, then resolved against that school's academic-year catalog. If a clause names multiple schools or the pair cannot be established, the response asks for clarification. For a verified pair of single groups, the response lists their shared and distinct group subjects by catalog code; it does not infer admission eligibility or list completeness beyond those groups.
+
+## 14. Exact context and Backend resolver contract — 2026-10-20
+
+- A successful Graph generation response includes `data.generation_context_exact=true` and `data.generation_context_sha256`. The digest is SHA-256 over the UTF-8 bytes of the exact `graph_context` string passed to `generator.generate_answer`. `data.retrieved_context` carries that same string; the response does not duplicate it in a `generation_context` field. This attests to the Graph evidence argument, not to the full system prompt or conversation history.
+- The evaluator accepts `retrieved_context` as exact generation evidence only when the explicit flag is true and its digest matches. It never infers exactness from `retrieval_units`, an oracle context, or a plain legacy response. Other response paths do not claim this Graph context contract.
+- `POST /api/v1/admissions/combinations/resolve-by-subjects` must return an object with `matches` as a list and a non-empty `resultScope`. Match, component, and label records are type-validated against the Backend response shape. An empty `matches: []` is valid `no_data`; missing/null/wrong-typed fields or malformed JSON produce HTTP 502 from the chatbot adapter. The error contains no raw upstream body.
+- School-group lookup can return only explicitly requested group codes. Subject-catalog lookup limits evidence to the requested subject or classification category.
+- If a student has not named a high school, the advice route acknowledges their stated preferences/strengths and asks for the school before comparing actual groups.
+- The router and answer model continue to read `settings.LLM_MODEL` from `.env`, currently `ag/claude-sonnet-4-6(high)`. Unit tests do not call the model or database.
+
+
+## Evaluation diagnostic addendum - combination lookup
+
+For an explicit admission-combination code, the resolver reads the combination-label endpoint and preserves all returned labels. It avoids interpreting a clearly named `G01`-style school-group code as an admission-combination code. For an explicit set of subject names, it resolves exact catalog names/aliases, requires 2-4 unique subjects, and calls the additive exact resolver endpoint `/api/v1/admissions/combinations/resolve-by-subjects`. Ambiguous names and insufficient subject sets produce a clarification. A zero-row search is reported as no matching data in the current dataset, not as proof that the combination does not exist.
+
+A code returned by the intent parser is used only when the code also appears in the current user message or a prior user turn. Assistant text is not code provenance. If the current turn names a different code than a stale parser filter, the current user-provided code takes precedence; multiple codes in the current turn trigger clarification.
+
+The evaluator diagnostic suite contains 20 deterministic fixtures for code lookup, name/subject resolution, ambiguity, errors, multiple candidates/labels, and conversation-history routing. The follow-up history case mocks the parser output; it verifies that prior turns reach the parser and does not establish live model parsing accuracy. Aptitude-only phrasing is not resolved by the regular-subject catalog yet and currently reaches subject-count clarification (fixture PR13); this remains a recorded diagnostic limitation.
+
+## Current R1a-R3c chat/retrieval contract - 2026-10-20
+
+- Admission combination lookup by a public code still uses `GET /api/v1/admissions/combinations/{code}` and preserves all latest labels, including unlinked labels. Lookup by an exact 2-4 subject set resolves catalog names/aliases, then calls the additive endpoint `POST /api/v1/admissions/combinations/resolve-by-subjects` with `{"subjectCodes":[...]}`. This endpoint only resolves exact subject-only compositions; `POST /api/v1/admissions/search-by-subjects` retains its existing capability-search semantics.
+- Comparison requests keep `academicYear` for the THPT school-year scope and send `admissionYear` and `methodCode` separately for admission evidence. Objective comparison does not require preferences/grades; personalized advice continues to require relevant user profile evidence. Missing requested groups/labels do not erase known facts; response data declares `answer_completeness` and missing codes.
+- Graph retrieval applies canonical combination, admission-year and method filters; high-school subject coverage honors explicit `academic_year`. Aptitude components are retained as separate requirements and clearly remain unverified by subject-group coverage.
+- Graph context records include stable `evidence_id`, business-key `relationship_ids` and `evidence_path`; `/api/chat` returns `context_evidence_ids`, `omitted_evidence_ids`, `retrieved_context`, and `evidence_truncated` for traceable context assembly.
+- Graph records include `evidence_dependency_validation` with complete/incomplete path status, required/missing relationship IDs, missing requested scope dependencies (for admission year/method or school/year), and explicit `aptitude_coverage: unverified` when applicable. A graph response becomes `answer_completeness: partial` when a retrieved record has an incomplete path; this does not claim that an aptitude component is satisfied by a THPT subject group.
+- Offline verification: 128 Data Scrawler tests and 12 focused Backend tests passed. Live service/database and paired benchmark validation have not been run.
+
+## Mixed school-group facts and advice
+
+When a request asks both which subject groups a named school offers and for tentative advice, the chatbot returns both tasks in one response. If the user has stated preferences or strengths, the existing comparison endpoint supplies group facts and preference matches. Advice is limited to those stated signals and verified `groupSubjects`, and the response retains the limitation that it does not establish admissions eligibility or outcome. If preferences are missing, the chatbot returns the verified group facts and asks for the missing preference information; it marks `answer_completeness` as `partial`.
+
+The response may include additive `requested_tasks`, `answered_tasks`, and `unanswered_tasks` arrays. Existing `status`, `message`, evidence, response mode, and execution-route fields keep their meanings. A deterministic school-group lookup without an advice request remains a concise lookup.
+
+Chat logs include parse, retrieval, and generation durations. Stage failures identify the stage and exception class without logging exception text, prompts, secrets, or conversation contents. These log fields do not change the response contract.
+
+## Graph pathway school identity resolution
+
+School mentions for graph, school-group, advice and comparison routes are resolved through the same Backend `GET /api/v1/high-schools` catalog matcher. A unique catalog match replaces the raw phrase with the catalog name and code; graph `SCHOOL_GROUPS_QUERY` uses that code as an exact identity filter, while Backend lookup handlers use it as the school business key. The optional `data.school_resolution` field records the resolved code/name and catalog provenance for school-group responses. A school name in the catalog may include a location qualifier; location metadata is used only when the catalog actually supplies it. If a name remains unknown or ambiguous, the chatbot asks the user to confirm the school and does not pass the raw phrase to a fuzzy graph filter. If the catalog is unavailable or malformed, the request fails closed with HTTP 503. Academic-year and subject-coverage matching remain unchanged. A program is returned as a school-to-program path only when verified school groups cover its required subjects or the missing subjects are marked mandatory; aptitude requirements remain separately unverified. No graph relationship is inferred from name similarity. University-only wording is not treated as an explicit THPT identity.
+
+For an explicit school, academic year, and group scope, the Graph route may return a `subject_overlap` partial result only when the selected group and program satisfy the requested school/year scope and each reported subject overlap is supported by the directed relationship IDs present in that record's evidence path. When the current question also names an exact admission combination, the response may separately report its acceptance only if the canonical combination, university/program, admission year, official HTTPS source domain, and corresponding directed `ACCEPTS_COMBINATION` edge all match. Admission-combination acceptance does not establish that the selected school group satisfies the full path. This partial result reports verified subject overlap; it does not establish complete admission eligibility. The Graph Evidence Contract V2 dependency status remains incomplete whenever required mandatory-subject scope or provenance is unavailable. If no overlap can be verified, the handler returns an incomplete response without asking generation to infer a negative result. Explicit group aliases are resolved against the authoritative school/year catalog; ambiguous aliases remain unresolved.
+
+### Approved response-mode decisions (2026-10-26)
+
+- For an unqualified school name that matches exactly one entry in the authoritative high-school catalog, the school-group lookup answers and discloses the canonical school, code, and catalog location as an explicit assumption. The user can correct that assumption. If the catalog returns multiple candidates, the chatbot asks for location or school code; it never selects a candidate by list order. Unknown or unavailable catalog results remain non-answers.
+- A year-specific eligibility question in the pathway route asks for any missing high-school identity, university, program, or admission year before making an eligibility conclusion. `academic_year` is not a substitute for `admission_year`. Known slots are not requested again. A narrow question asking whether one shared subject by itself guarantees eligibility or admission receives a general no-guarantee answer without asserting year-specific eligibility; a concrete eligibility comparison still requires the admission year. This gate does not change ordinary pathway information lookups.
+- These two behavior decisions are recorded as human-reviewed `behavior_gold` annotations in the separately fingerprinted response-mode approval sidecar. They do not approve reference answers, factual claims, graph paths, or any other scenarios.
+
+Cross-school group comparison resolves and queries each school independently using the same requested academic year. Results carry only evidence returned for that school; a missing requested group is reported in `unavailable_group_requests`, and a school with no available source result is reported separately. A response may be marked partial when at least one school's facts are verified. It does not infer shared/different subjects for a school whose requested evidence is unavailable. Singular history references such as “nhóm đó” ask for clarification when the prior user turn named multiple distinct group codes.
+
+Graph generation trims leading and trailing whitespace from the formatted retriever context before passing it to the generator. `retrieved_context` and `generation_context_sha256` attest to that same normalized string.
+
+In explicitly enabled diagnostics, the append-only stage trace records a `generation` / `input` event immediately before the provider POST. It contains the trimmed graph-context character and UTF-8 byte counts, its SHA-256 digest, full message-content size, message/history counts, and the configured provider timeout. It never stores prompt text, answers, API credentials, or provider response bodies. The event remains available if the provider request times out; it does not establish why the provider was slow or supply a token count without tokenizer data.
+
+For subject-group advice, the response names candidate groups only when their explicit `groupSubjects` contains a subject the student stated they like. Multiple matching groups are presented as unranked tentative candidates. If no candidate is supported by the available evidence, the response gives the verified group facts and asks for more preference information; the advice task is marked unanswered and the result partial. Candidate wording is explicitly tentative and does not imply guaranteed fit or admissions eligibility.
